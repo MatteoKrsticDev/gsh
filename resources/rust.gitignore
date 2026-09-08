@@ -1,6 +1,0 @@
-# Build output
-/target/
-**/*.rs.bk
-
-# Backtraces
-*.pdb
