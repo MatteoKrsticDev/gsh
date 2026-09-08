@@ -26,9 +26,49 @@ unset GSH_REEXEC
 
 set -u
 
-SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
-GSH_DIR=$(dirname "$SCRIPT_DIR")
+# $0 is routinely a symlink - Homebrew links /usr/local/bin/gsh into the Cellar
+# - and 'dirname $0' would then point at the link, not at the install. macOS
+# readlink has no -f, so follow the chain by hand; the hop limit is what stops a
+# symlink cycle from hanging the shell.
+resolve_self() {
+    local p="$1" d hops=0
+    while [ -L "$p" ]; do
+        hops=$((hops + 1))
+        [ "$hops" -le 40 ] || return 1
+        d=$(cd "$(dirname "$p")" 2>/dev/null && pwd) || return 1
+        p=$(readlink "$p")
+        case "$p" in /*) ;; *) p="$d/$p" ;; esac
+    done
+    d=$(cd "$(dirname "$p")" 2>/dev/null && pwd) || return 1
+    printf '%s/%s\n' "$d" "${p##*/}"
+}
+
+SELF=$(resolve_self "$0") || SELF="$0"
+SCRIPT_DIR=$(dirname "$SELF")
+
+# Where resources/ and current.txt live. The clone layout (<script>/../resources)
+# is tried before the packaged ones so a checkout always wins over a stale
+# system install; the relative packaged path wins over the absolute fallbacks so
+# a --prefix install is not shadowed by /usr.
+GSH_HOME_CANDIDATES="$SCRIPT_DIR/..
+$SCRIPT_DIR/../share/gsh
+/usr/local/share/gsh
+/usr/share/gsh"
+
+GSH_DIR=''
+if [ -n "${GSH_HOME:-}" ]; then
+    GSH_DIR="$GSH_HOME"
+else
+    while IFS= read -r cand; do
+        [ -d "$cand/resources" ] || continue
+        GSH_DIR=$(cd "$cand" && pwd) && break
+    done <<EOF
+$GSH_HOME_CANDIDATES
+EOF
+fi
+
 RESOURCES="$GSH_DIR/resources"
+VERSION_FILE="$GSH_DIR/current.txt"
 
 API="${GSH_API:-https://www.toptal.com/developers/gitignore/api}"
 CACHE_DIR="${GSH_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/gsh}"
@@ -50,12 +90,17 @@ REFRESH=0
 
 is_tty() { [ -t 1 ]; }
 
-use_color() {
+color_allowed() {
     [ "$NO_COLOR_FLAG" -eq 0 ] || return 1
-    [ -z "${NO_COLOR:-}" ] || return 1
+    # no-color.org: the variable disables colour by its presence, not its value
+    [ -z "${NO_COLOR+x}" ] || return 1
     [ "${TERM:-}" != "dumb" ] || return 1
-    [ -t 1 ] || [ -t 2 ]
 }
+
+# One gate per stream. A terminal on stdout says nothing about stderr, and
+# 'gsh doctor > report.txt' from a terminal must leave the file clean.
+use_color()     { color_allowed && [ -t 1 ]; }
+use_color_err() { color_allowed && [ -t 2 ]; }
 
 use_unicode() {
     [ "$ASCII_FLAG" -eq 0 ] || return 1
@@ -70,13 +115,21 @@ use_unicode() {
 }
 
 setup_style() {
+    # C_* colours what goes to stdout, E_* what goes to stderr
+    C_RESET=''; C_BOLD=''; C_DIM=''
+    C_RED=''; C_GREEN=''; C_YELLOW=''; C_BLUE=''; C_CYAN=''
+    E_RESET=''; E_BOLD=''; E_DIM=''
+    E_RED=''; E_GREEN=''; E_YELLOW=''; E_BLUE=''; E_CYAN=''
+
     if use_color; then
         C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'
         C_RED=$'\033[0;31m'; C_GREEN=$'\033[0;32m'; C_YELLOW=$'\033[0;33m'
         C_BLUE=$'\033[0;34m'; C_CYAN=$'\033[0;36m'
-    else
-        C_RESET=''; C_BOLD=''; C_DIM=''
-        C_RED=''; C_GREEN=''; C_YELLOW=''; C_BLUE=''; C_CYAN=''
+    fi
+    if use_color_err; then
+        E_RESET=$'\033[0m'; E_BOLD=$'\033[1m'; E_DIM=$'\033[2m'
+        E_RED=$'\033[0;31m'; E_GREEN=$'\033[0;32m'; E_YELLOW=$'\033[0;33m'
+        E_BLUE=$'\033[0;34m'; E_CYAN=$'\033[0;36m'
     fi
 
     if use_unicode; then
@@ -89,9 +142,9 @@ setup_style() {
 }
 
 ok()    { printf '%s %s\n' "${C_GREEN}${I_OK}${C_RESET}" "$*"; }
-err()   { printf '%s %s\n' "${C_RED}${I_ERR}${C_RESET}" "$*" >&2; }
-warn()  { printf '%s %s\n' "${C_YELLOW}${I_WARN}${C_RESET}" "$*" >&2; }
-info()  { printf '%s %s\n' "${C_BLUE}${I_INFO}${C_RESET}" "$*" >&2; }
+err()   { printf '%s %s\n' "${E_RED}${I_ERR}${E_RESET}" "$*" >&2; }
+warn()  { printf '%s %s\n' "${E_YELLOW}${I_WARN}${E_RESET}" "$*" >&2; }
+info()  { printf '%s %s\n' "${E_BLUE}${I_INFO}${E_RESET}" "$*" >&2; }
 dot()   { printf '  %s %s\n' "${C_DIM}${I_DOT}${C_RESET}" "$*"; }
 dim()   { printf '%s\n' "${C_DIM}$*${C_RESET}"; }
 title() { printf '\n%s\n' "${C_BOLD}$*${C_RESET}"; }
@@ -118,7 +171,7 @@ spinner_run() {
     while kill -0 "$pid" 2>/dev/null; do
         for f in $frames; do
             kill -0 "$pid" 2>/dev/null || break
-            printf '\r%s %s' "${C_CYAN}${f}${C_RESET}" "${C_DIM}${msg}${C_RESET}" >&2
+            printf '\r%s %s' "${E_CYAN}${f}${E_RESET}" "${E_DIM}${msg}${E_RESET}" >&2
             sleep 0.08
         done
     done
@@ -132,7 +185,7 @@ spinner_run() {
 confirm() {
     [ "$ASSUME_YES" -eq 1 ] && return 0
     local ans=''
-    printf '%s %s %s' "${C_YELLOW}?${C_RESET}" "$1" "${C_DIM}[y/N]${C_RESET} " >&2
+    printf '%s %s %s' "${E_YELLOW}?${E_RESET}" "$1" "${E_DIM}[y/N]${E_RESET} " >&2
     read -r ans || true
     case "$ans" in [Yy]*) return 0 ;; *) return 1 ;; esac
 }
@@ -438,10 +491,14 @@ write_block() {
     [ "$(tail -n 1 .gitignore 2>/dev/null)" = "$MARK_END" ]
 }
 
+# ensure_gitignore [asked]
+#   'asked' means the caller already got a yes for this write, so creating the
+#   file is part of what the user agreed to - asking again is a second question
+#   about the same decision, and it breaks 'echo y | gsh auto'.
 ensure_gitignore() {
     writable_gitignore || return 1
     if [ -f .gitignore ]; then return 0; fi
-    if [ "$ASSUME_YES" -eq 0 ]; then
+    if [ "$ASSUME_YES" -eq 0 ] && [ "${1:-}" != asked ]; then
         confirm ".gitignore not found, create it?" || {
             err "aborted"
             return 1
@@ -498,9 +555,26 @@ install_templates() {
 # ---------------------------------------------------------------------------
 
 cmd_version() {
-    local file="$GSH_DIR/current.txt" v='unknown'
-    [ -f "$file" ] && v=$(sed -n 's/^[Vv]ersion:[[:space:]]*//p' "$file" | head -n 1)
+    local v='unknown'
+    [ -f "$VERSION_FILE" ] &&
+        v=$(sed -n 's/^[Vv]ersion:[[:space:]]*//p' "$VERSION_FILE" | head -n 1)
     printf '%sgsh%s %s\n' "$C_BOLD" "$C_RESET" "${v:-unknown}"
+}
+
+# help for one command; anything unrecognised falls through to the full help
+cmd_help_for() {
+    case "$1" in
+    init | i)     set -- "gsh init" "create an empty .gitignore (requires a git repo)" ;;
+    auto)         set -- "gsh auto [-y]" "detect the project stack and build .gitignore" ;;
+    add | a)      set -- "gsh add <template> [template...] [-y]" "add templates to .gitignore" ;;
+    doctor | doc) set -- "gsh doctor" "check the repo for gitignore problems" ;;
+    list | l)     set -- "gsh list [filter]" "list templates; filter is a substring, not a regex" ;;
+    show)         set -- "gsh show <template> [template...]" "print templates without installing them" ;;
+    version | v)  set -- "gsh version" "show the installed version" ;;
+    *)            cmd_help; return 0 ;;
+    esac
+    printf '%sUsage:%s %s\n\n  %s\n\n' "$C_BOLD" "$C_RESET" "$1" "$2"
+    dim "  gsh help   for all commands, options and environment variables"
 }
 
 cmd_help() {
@@ -518,8 +592,18 @@ cmd_help() {
     printf '\n%sOptions:%s\n' "$C_BOLD" "$C_RESET"
     printf '  %-22s %s\n' "-y, --yes"    "assume yes, never prompt"
     printf '  %-22s %s\n' "--refresh"    "ignore the cache and refetch"
-    printf '  %-22s %s\n' "--no-color"   "disable colors"
-    printf '  %-22s %s\n' "--ascii"      "ASCII icons instead of unicode"
+    printf '  %-22s %s\n' "--no-color"   "disable colors (NO_COLOR is honoured too)"
+    printf '  %-22s %s\n' "--ascii"      "ASCII icons (GSH_ASCII is honoured too)"
+    printf '  %-22s %s\n' "-h, --help"   "help for the command it follows"
+    printf '  %-22s %s\n' "-v, --version" "show the installed version"
+    printf '\n%sEnvironment:%s\n' "$C_BOLD" "$C_RESET"
+    printf '  %-22s %s\n' "GSH_HOME"      "directory holding resources/ and current.txt"
+    printf '  %-22s %s\n' "GSH_API"       "gitignore.io API base URL"
+    printf '  %-22s %s\n' "GSH_CACHE_DIR" "cache location (default ~/.cache/gsh)"
+    printf '  %-22s %s\n' "GSH_CACHE_TTL" "cache lifetime in seconds (default 86400)"
+    printf '\n%sExit codes:%s\n' "$C_BOLD" "$C_RESET"
+    printf '  %-2s %s\n' "0" "success; for doctor, no problems found"
+    printf '  %-2s %s\n' "1" "failure, aborted, or doctor found a problem"
     printf '\n%sExamples:%s\n' "$C_BOLD" "$C_RESET"
     dim "  gsh auto                 # the usual one-liner after git init"
     dim "  gsh add node macos       # explicit templates, one request"
@@ -544,7 +628,9 @@ cmd_list() {
     ensure_catalog
     out=$(catalog)
     if [ -n "$filter" ]; then
-        out=$(printf '%s\n' "$out" | grep -i -- "$filter") || {
+        # -F: the filter is a substring the user typed, not a regex. Without it
+        # 'gsh list [' dies inside grep with an error gsh never wrote.
+        out=$(printf '%s\n' "$out" | grep -iF -- "$filter") || {
             err "no template matches '$filter'"
             return 1
         }
@@ -553,9 +639,9 @@ cmd_list() {
     local n
     n=$(printf '%s\n' "$out" | sed '/^$/d' | wc -l | tr -d ' ')
     if [ -n "$filter" ]; then
-        info "$n templates matching ${C_BOLD}${filter}${C_RESET}"
+        info "$n templates matching ${E_BOLD}${filter}${E_RESET}"
     else
-        info "$n templates available ${C_DIM}(gsh list <filter> to search)${C_RESET}"
+        info "$n templates available ${E_DIM}(gsh list <filter> to search)${E_RESET}"
     fi
 
     if is_tty && command -v column >/dev/null 2>&1; then
@@ -566,14 +652,17 @@ cmd_list() {
 }
 
 cmd_show() {
-    local name="${1:-}"
-    [ -n "$name" ] || { err "usage: gsh show <template>"; return 1; }
+    [ $# -gt 0 ] || { err "usage: gsh show <template> [template...]"; return 1; }
     ensure_catalog
-    known_template "$name" || { err "unknown template: $name"; return 1; }
-    fetch_bundle "$name"
+    local n
+    for n in "$@"; do
+        known_template "$n" || { err "unknown template: $n"; return 1; }
+    done
+    fetch_bundle "$@"
 }
 
 cmd_add() {
+    require_git_repo || return 1
     [ $# -gt 0 ] || {
         err "no template given"
         dim "  usage: gsh add <template> [template...]   (gsh list to browse)"
@@ -646,6 +735,7 @@ detect_stack() {
 }
 
 cmd_auto() {
+    require_git_repo || return 1
     ensure_catalog
 
     local found
@@ -694,9 +784,10 @@ EOF
     printf '\n'
     local joined
     joined=$(printf '%s' "$names" | sed 's/^ //' | tr ' ' ',')
-    confirm "Add ${C_BOLD}${joined}${C_RESET} to .gitignore?" || { info "aborted"; return 0; }
+    # non-zero: a CI job that forgot -y must not look like it did the work
+    confirm "Add ${E_BOLD}${joined}${E_RESET} to .gitignore?" || { info "aborted"; return 1; }
 
-    ensure_gitignore || return 1
+    ensure_gitignore asked || return 1
     install_templates $names
 }
 
@@ -852,15 +943,19 @@ POS=''
 POS_N=0
 set_pos() { POS_N=$((POS_N + 1)); eval "POS_$POS_N=\$1"; }
 
-parsed=''
+WANT_HELP=0
+WANT_VERSION=0
+
+# -h and -v are flags, not positionals: turning them into arguments is why
+# 'gsh add --help' used to report an unknown template named 'help'.
 while [ $# -gt 0 ]; do
     case "$1" in
     -y | --yes)   ASSUME_YES=1 ;;
     --no-color)   NO_COLOR_FLAG=1 ;;
     --ascii)      ASCII_FLAG=1 ;;
     --refresh)    REFRESH=1 ;;
-    -h | --help)  set_pos "help" ;;
-    -v | --version) set_pos "version" ;;
+    -h | --help)  WANT_HELP=1 ;;
+    -v | --version) WANT_VERSION=1 ;;
     --) shift; while [ $# -gt 0 ]; do set_pos "$1"; shift; done; break ;;
     *) set_pos "$1" ;;
     esac
@@ -869,6 +964,16 @@ done
 
 setup_style
 
+if [ -z "$GSH_DIR" ]; then
+    err "cannot find gsh's data directory (the one holding resources/)"
+    dim "  looked in:"
+    printf '%s\n' "$GSH_HOME_CANDIDATES" | while IFS= read -r cand; do
+        dim "    $cand"
+    done
+    dim "  fix: set GSH_HOME to the directory holding resources/ and current.txt"
+    exit 1
+fi
+
 set --
 i=1
 while [ "$i" -le "$POS_N" ]; do
@@ -876,13 +981,17 @@ while [ "$i" -le "$POS_N" ]; do
     i=$((i + 1))
 done
 
+# both short-circuit: they answer a question about gsh, not about the command
+[ "$WANT_VERSION" -eq 1 ] && { cmd_version; exit 0; }
+[ "$WANT_HELP" -eq 1 ] && { cmd_help_for "${1:-}"; exit 0; }
+
 case "${1:-help}" in
 "init" | "i")        shift 2>/dev/null; cmd_init ;;
 "auto")              shift 2>/dev/null; cmd_auto ;;
 "add" | "a")         shift; cmd_add "$@" ;;
 "doctor" | "doc")    shift 2>/dev/null; cmd_doctor ;;
 "list" | "l")        shift; cmd_list "${1:-}" ;;
-"show")              shift; cmd_show "${1:-}" ;;
+"show")              shift; cmd_show "$@" ;;
 "version" | "v")     cmd_version ;;
 "help" | "h")        cmd_help ;;
 *)

@@ -9,7 +9,44 @@
 
 set -u
 
-GSH_DIR=$(cd "$(dirname "$0")" && pwd)
+# Same resolution as gsh/main, so both agree on where current.txt lives: follow
+# symlinks by hand (macOS readlink has no -f), then look for the directory that
+# carries resources/. 'update' sits at the root of a clone, so its own directory
+# is the first candidate; gsh/main's is one level up from the script.
+resolve_self() {
+    local p="$1" d hops=0
+    while [ -L "$p" ]; do
+        hops=$((hops + 1))
+        [ "$hops" -le 40 ] || return 1
+        d=$(cd "$(dirname "$p")" 2>/dev/null && pwd) || return 1
+        p=$(readlink "$p")
+        case "$p" in /*) ;; *) p="$d/$p" ;; esac
+    done
+    d=$(cd "$(dirname "$p")" 2>/dev/null && pwd) || return 1
+    printf '%s/%s\n' "$d" "${p##*/}"
+}
+
+SELF=$(resolve_self "$0") || SELF="$0"
+SCRIPT_DIR=$(dirname "$SELF")
+
+GSH_HOME_CANDIDATES="$SCRIPT_DIR
+$SCRIPT_DIR/..
+$SCRIPT_DIR/../share/gsh
+/usr/local/share/gsh
+/usr/share/gsh"
+
+GSH_DIR=''
+if [ -n "${GSH_HOME:-}" ]; then
+    GSH_DIR="$GSH_HOME"
+else
+    while IFS= read -r cand; do
+        [ -d "$cand/resources" ] || continue
+        GSH_DIR=$(cd "$cand" && pwd) && break
+    done <<EOF
+$GSH_HOME_CANDIDATES
+EOF
+fi
+
 VERSION_FILE="$GSH_DIR/current.txt"
 REMOTE_URL="${GSH_REMOTE_URL:-https://raw.githubusercontent.com/MatteoKrsticDev/gsh/main/current.txt}"
 
@@ -79,18 +116,29 @@ usage() {
     printf '      --ascii     ASCII icons (GSH_ASCII is honoured too)\n'
     printf '  -h, --help      show this help\n\n'
     printf '%sEnvironment%s\n' "$C_BOLD" "$C_RESET"
+    printf '  GSH_HOME        directory holding resources/ and current.txt\n'
     printf '  GSH_REMOTE_URL  where to read the published version from\n'
     printf '                  (default: %s)\n\n' \
         "https://raw.githubusercontent.com/MatteoKrsticDev/gsh/main/current.txt"
     printf '%sExit codes%s\n' "$C_BOLD" "$C_RESET"
     printf '  0  already up to date, or updated and verified\n'
-    printf '  1  could not reach the remote, or git pull failed - nothing changed\n'
+    printf '  1  nothing changed: remote unreachable, not a clone, or git pull failed\n'
     printf '  2  git pull succeeded but the new version did not land\n'
 }
 
 if [ "$SHOW_HELP" -eq 1 ]; then
     usage
     exit 0
+fi
+
+if [ -z "$GSH_DIR" ]; then
+    err "cannot find gsh's data directory (the one holding resources/)"
+    dim "  looked in:"
+    printf '%s\n' "$GSH_HOME_CANDIDATES" | while IFS= read -r cand; do
+        dim "    $cand"
+    done
+    dim "  fix: set GSH_HOME to the directory holding resources/ and current.txt"
+    exit 1
 fi
 
 spinner_run() {
@@ -144,10 +192,18 @@ if [ -f "$VERSION_FILE" ] && cmp -s "$tmp" "$VERSION_FILE"; then
     exit 0
 fi
 
-if [ ! -d "$GSH_DIR/.git" ]; then
-    err "$GSH_DIR is not a git checkout, update aborted"
-    dim "  gsh-update updates by pulling; this copy was not cloned."
-    dim "  fix: git clone https://github.com/MatteoKrsticDev/gsh.git && bash gsh/setup"
+# A packaged install is owned by the package manager: 'git pull' has nothing to
+# pull and would be the wrong tool even if it did. '.git' can be a file (a
+# worktree or a submodule), so ask git rather than looking for a directory.
+if ! git -C "$GSH_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    err "gsh at $GSH_DIR was not installed from a git clone, update aborted"
+    dim "  gsh-update updates by pulling, which is not how this copy got here."
+    dim "  fix: update it the way you installed it -"
+    printf '    %-12s %sbrew upgrade gsh%s\n' "Homebrew" "$C_CYAN" "$C_RESET"
+    printf '    %-12s %ssudo pacman -Syu gsh%s\n' "Arch/AUR" "$C_CYAN" "$C_RESET"
+    printf '    %-12s %ssudo apt update && sudo apt upgrade gsh%s\n' "Debian" "$C_CYAN" "$C_RESET"
+    dim "  or install a clone you own:"
+    dim "    git clone https://github.com/MatteoKrsticDev/gsh.git && bash gsh/setup"
     exit 1
 fi
 
