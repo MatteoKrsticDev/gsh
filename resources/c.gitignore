@@ -1,0 +1,24 @@
+# Object files
+*.o
+*.obj
+*.ko
+
+# Libraries
+*.a
+*.la
+*.lo
+*.so
+*.so.*
+*.dylib
+*.dll
+
+# Executables
+*.exe
+*.out
+*.app
+
+# Build directories
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
