@@ -1,25 +1,172 @@
 #!/bin/bash
+#
+# gsh self-update - pulls the repo when the remote version differs.
+#
+# exit codes:  0 already up to date, or updated and verified
+#              1 network / git failure, nothing was changed
+#              2 git pull reported success but the new version did not land
+#
 
-# colors
-YELLOW='\033[0;33m'
+set -u
 
+GSH_DIR=$(cd "$(dirname "$0")" && pwd)
+VERSION_FILE="$GSH_DIR/current.txt"
+REMOTE_URL="${GSH_REMOTE_URL:-https://raw.githubusercontent.com/MatteoKrsticDev/gsh/main/current.txt}"
 
-# curl the latest version of the script
+NO_COLOR_FLAG=0
+ASCII_FLAG=0
+SHOW_HELP=0
 
-curl https://raw.githubusercontent.com/MatteoKrsticDev/gsh/main/current.txt >> tempVersion.txt
- 
+while [ $# -gt 0 ]; do
+    case "$1" in
+    -h | --help) SHOW_HELP=1 ;;
+    --no-color) NO_COLOR_FLAG=1 ;;
+    --ascii) ASCII_FLAG=1 ;;
+    *)
+        printf 'gsh-update: unknown option: %s\n' "$1" >&2
+        printf "gsh-update: run 'gsh-update --help' for usage\n" >&2
+        exit 1
+        ;;
+    esac
+    shift
+done
 
-if [ "$(cat tempVersion.txt)" == "$(cat current.txt)" ]; then
-    echo "You are already using the latest version of gsh"
-    rm tempVersion.txt
+# --- style -----------------------------------------------------------------
+use_color() {
+    [ "$NO_COLOR_FLAG" -eq 0 ] || return 1
+    # no-color.org: the variable disables colour by its presence, not its value
+    [ -z "${NO_COLOR+x}" ] || return 1
+    [ "${TERM:-}" != "dumb" ] || return 1
+    [ -t 1 ]
+}
 
+use_unicode() {
+    [ "$ASCII_FLAG" -eq 0 ] || return 1
+    [ -z "${GSH_ASCII:-}" ] || return 1
+    local loc="${LC_ALL:-${LC_CTYPE:-${LANG:-}}}"
+    # no locale set at all: modern terminals are UTF-8, assume so
+    [ -n "$loc" ] || return 0
+    case "$loc" in
+    *[Uu][Tt][Ff]*) return 0 ;;
+    *) return 1 ;;
+    esac
+}
+
+if use_color; then
+    C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'
+    C_RED=$'\033[0;31m'; C_GREEN=$'\033[0;32m'; C_CYAN=$'\033[0;36m'
 else
-    echo "Updating gsh"
-    rm current.txt
-    curl https://raw.githubusercontent.com/MatteoKrsticDev/gsh/main/current.txt >> current.txt
-    rm tempVersion.txt
-    git fetch 
-    git pull
-    clear
-    echo -e "${YELLOW}gsh updated${NC}"
+    C_RESET=''; C_BOLD=''; C_DIM=''; C_RED=''; C_GREEN=''; C_CYAN=''
 fi
+
+if use_unicode; then
+    I_OK='✓'; I_ERR='✗'; SPIN='⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏'
+else
+    I_OK='+'; I_ERR='x'; SPIN='| / - \'
+fi
+
+ok()  { printf '%s %s\n' "${C_GREEN}${I_OK}${C_RESET}" "$*"; }
+err() { printf '%s %s\n' "${C_RED}${I_ERR}${C_RESET}" "$*" >&2; }
+dim() { printf '%s\n' "${C_DIM}$*${C_RESET}"; }
+
+usage() {
+    printf '%sgsh-update%s %s- update gsh in place%s\n\n' \
+        "$C_BOLD" "$C_RESET" "$C_DIM" "$C_RESET"
+    printf '%sUsage%s\n' "$C_BOLD" "$C_RESET"
+    printf '  gsh-update [options]\n\n'
+    printf '%sOptions%s\n' "$C_BOLD" "$C_RESET"
+    printf '      --no-color  plain output (NO_COLOR is honoured too)\n'
+    printf '      --ascii     ASCII icons (GSH_ASCII is honoured too)\n'
+    printf '  -h, --help      show this help\n\n'
+    printf '%sEnvironment%s\n' "$C_BOLD" "$C_RESET"
+    printf '  GSH_REMOTE_URL  where to read the published version from\n'
+    printf '                  (default: %s)\n\n' \
+        "https://raw.githubusercontent.com/MatteoKrsticDev/gsh/main/current.txt"
+    printf '%sExit codes%s\n' "$C_BOLD" "$C_RESET"
+    printf '  0  already up to date, or updated and verified\n'
+    printf '  1  could not reach the remote, or git pull failed - nothing changed\n'
+    printf '  2  git pull succeeded but the new version did not land\n'
+}
+
+if [ "$SHOW_HELP" -eq 1 ]; then
+    usage
+    exit 0
+fi
+
+spinner_run() {
+    local msg="$1"; shift
+    if [ ! -t 2 ]; then "$@"; return $?; fi
+    "$@" &
+    local pid=$! rc=0 f
+    printf '\033[?25l' >&2
+    trap 'printf "\033[?25h" >&2' INT TERM
+    while kill -0 "$pid" 2>/dev/null; do
+        for f in $SPIN; do
+            kill -0 "$pid" 2>/dev/null || break
+            printf '\r%s %s' "${C_CYAN}${f}${C_RESET}" "${C_DIM}${msg}${C_RESET}" >&2
+            sleep 0.08
+        done
+    done
+    wait "$pid"; rc=$?
+    printf '\r\033[K\033[?25h' >&2
+    trap - INT TERM
+    return $rc
+}
+
+version_of() {
+    [ -f "$1" ] || return 0
+    sed -n 's/^[Vv]ersion:[[:space:]]*//p' "$1" | head -n 1 | tr -d '\r'
+}
+
+tmp=$(mktemp) || { err "cannot create a temporary file"; exit 1; }
+trap 'rm -f "$tmp"' EXIT
+
+if ! spinner_run "checking for updates" \
+    curl -fsL --max-time 20 "$REMOTE_URL" -o "$tmp"; then
+    err "cannot reach GitHub, update aborted"
+    dim "  tried: $REMOTE_URL"
+    dim "  fix: check your connection, then run gsh-update again"
+    exit 1
+fi
+
+REMOTE_VERSION=$(version_of "$tmp")
+if [ -z "$REMOTE_VERSION" ]; then
+    err "unexpected reply from the version endpoint, update aborted"
+    dim "  $REMOTE_URL returned no 'Version:' line"
+    dim "  fix: open that URL in a browser; if it looks wrong, report it"
+    exit 1
+fi
+
+LOCAL_VERSION=$(version_of "$VERSION_FILE")
+
+if [ -f "$VERSION_FILE" ] && cmp -s "$tmp" "$VERSION_FILE"; then
+    ok "already up to date ${C_DIM}(${LOCAL_VERSION})${C_RESET}"
+    exit 0
+fi
+
+if [ ! -d "$GSH_DIR/.git" ]; then
+    err "$GSH_DIR is not a git checkout, update aborted"
+    dim "  gsh-update updates by pulling; this copy was not cloned."
+    dim "  fix: git clone https://github.com/MatteoKrsticDev/gsh.git && bash gsh/setup"
+    exit 1
+fi
+
+if ! spinner_run "updating gsh" git -C "$GSH_DIR" pull --ff-only -q; then
+    err "git pull failed, update aborted"
+    dim "  you may have local changes: cd $GSH_DIR && git status"
+    exit 1
+fi
+
+# a pull can succeed and still not bring the new version: wrong branch, a
+# remote that is behind its own raw endpoint, a fast-forward that landed
+# nothing. Trust the file on disk, not the exit status.
+if ! cmp -s "$tmp" "$VERSION_FILE"; then
+    NEW_LOCAL=$(version_of "$VERSION_FILE")
+    err "update did not take, gsh is still at ${NEW_LOCAL:-unknown}"
+    dim "  git pull succeeded but $VERSION_FILE does not match the published ${REMOTE_VERSION}."
+    dim "  fix: cd $GSH_DIR && git status && git branch -vv"
+    dim "       make sure the branch you track is the one carrying ${REMOTE_VERSION}"
+    exit 2
+fi
+
+ok "gsh updated to ${C_BOLD}$(version_of "$VERSION_FILE")${C_RESET} ${C_DIM}(was ${LOCAL_VERSION:-unknown})${C_RESET}"

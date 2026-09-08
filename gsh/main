@@ -1,66 +1,894 @@
 #!/bin/bash
+#
+# gsh - gitignore.sh
+# Build and maintain .gitignore files from the gitignore.io catalog.
+#
 
-GREEN='\033[0;32m'
-RED='\033[0;31m'
-YELLOW='\033[0;33m'
-NC='\033[0m'
+# This file needs real bash: arrays and process substitution in cmd_doctor,
+# $'...' throughout, and IFS=$'\t' in cmd_auto - which dash reads as the two
+# characters '$' and 't', silently swallowing every detection row. bash invoked
+# as 'sh' is not enough either: POSIX mode disables process substitution. Must
+# stay above the first bash-only construct, because sh parses and runs this file
+# one command at a time and would die before reaching us.
+gsh_real_bash() {
+    [ -n "${BASH_VERSION:-}" ] || return 1
+    case "${SHELLOPTS:-}" in *posix*) return 1 ;; esac
+}
+if ! gsh_real_bash; then
+    if [ -n "${GSH_REEXEC:-}" ] || ! command -v bash >/dev/null 2>&1; then
+        printf 'gsh: needs bash (not sh or dash, and not POSIX mode)\n' >&2
+        exit 1
+    fi
+    unset POSIXLY_CORRECT
+    GSH_REEXEC=1 exec bash "$0" "$@"
+fi
+unset GSH_REEXEC
 
-# Check gsh version
-checkVersion() {}
+set -u
 
-# Main functions
-addLine() {
-    existFile
-    if [ $1 == "" ]; then echo -e "${RED}[ERR]${NC} No file name provided"; exit 1; fi
-    url="https://raw.githubusercontent.com/MatteoKrsticDev/gsh/main/resources/$1.gitignore"
-    if [ $(curl $url) = "404: Not Found"]; then echo -e "${RED}[ERR]${NC} File not found"; exit 1; fi
-    content=$(curl $url | sed 's/\r//g') 
-    echo "### $1.gitignore ###\n\n$content\n" >> .gitignore
-    echo -e "${GREEN}[OK]${NC} $1.gitignore added to .gitignore"
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+GSH_DIR=$(dirname "$SCRIPT_DIR")
+RESOURCES="$GSH_DIR/resources"
+
+API="${GSH_API:-https://www.toptal.com/developers/gitignore/api}"
+CACHE_DIR="${GSH_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/gsh}"
+LIST_CACHE="$CACHE_DIR/list.txt"
+TPL_CACHE="$CACHE_DIR/templates"
+CACHE_TTL="${GSH_CACHE_TTL:-86400}"
+
+MARK_START="### gsh:start"
+MARK_END="### gsh:end ###"
+
+ASSUME_YES=0
+NO_COLOR_FLAG=0
+ASCII_FLAG=0
+REFRESH=0
+
+# ---------------------------------------------------------------------------
+# Presentation
+# ---------------------------------------------------------------------------
+
+is_tty() { [ -t 1 ]; }
+
+use_color() {
+    [ "$NO_COLOR_FLAG" -eq 0 ] || return 1
+    [ -z "${NO_COLOR:-}" ] || return 1
+    [ "${TERM:-}" != "dumb" ] || return 1
+    [ -t 1 ] || [ -t 2 ]
 }
 
-existFile() {
-    if [ -f ".gitignore" ]; then
-        echo "${YELLOW}[IN]${NC} .gitignore exist, installing template"
-    else
-        read -p ".gitignore not found, do you want to create it? [y/n] " yn
+use_unicode() {
+    [ "$ASCII_FLAG" -eq 0 ] || return 1
+    [ -z "${GSH_ASCII:-}" ] || return 1
+    local loc="${LC_ALL:-${LC_CTYPE:-${LANG:-}}}"
+    # no locale set at all: modern terminals are UTF-8, assume so
+    [ -n "$loc" ] || return 0
+    case "$loc" in
+    *[Uu][Tt][Ff]*) return 0 ;;
+    *) return 1 ;;
+    esac
+}
 
-        case $yn in
-        [Yy]*)
-            touch .gitignore
-            echo -e "${GREEN}[OK]${NC} Creating .gitignore"
-            echo -e "${YELLOW}[IN]${NC} continue with the installation..."
+setup_style() {
+    if use_color; then
+        C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'
+        C_RED=$'\033[0;31m'; C_GREEN=$'\033[0;32m'; C_YELLOW=$'\033[0;33m'
+        C_BLUE=$'\033[0;34m'; C_CYAN=$'\033[0;36m'
+    else
+        C_RESET=''; C_BOLD=''; C_DIM=''
+        C_RED=''; C_GREEN=''; C_YELLOW=''; C_BLUE=''; C_CYAN=''
+    fi
+
+    if use_unicode; then
+        I_OK='✓'; I_ERR='✗'; I_WARN='!'; I_INFO='›'; I_DOT='•'; I_ARROW='→'
+        SPIN_FRAMES='⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏'
+    else
+        I_OK='+'; I_ERR='x'; I_WARN='!'; I_INFO='>'; I_DOT='*'; I_ARROW='->'
+        SPIN_FRAMES='| / - \'
+    fi
+}
+
+ok()    { printf '%s %s\n' "${C_GREEN}${I_OK}${C_RESET}" "$*"; }
+err()   { printf '%s %s\n' "${C_RED}${I_ERR}${C_RESET}" "$*" >&2; }
+warn()  { printf '%s %s\n' "${C_YELLOW}${I_WARN}${C_RESET}" "$*" >&2; }
+info()  { printf '%s %s\n' "${C_BLUE}${I_INFO}${C_RESET}" "$*" >&2; }
+dot()   { printf '  %s %s\n' "${C_DIM}${I_DOT}${C_RESET}" "$*"; }
+dim()   { printf '%s\n' "${C_DIM}$*${C_RESET}"; }
+title() { printf '\n%s\n' "${C_BOLD}$*${C_RESET}"; }
+
+is_tty_err() { [ -t 2 ]; }
+hide_cursor() { is_tty_err && printf '\033[?25l' >&2; }
+show_cursor() { is_tty_err && printf '\033[?25h' >&2; }
+
+# spinner_run <message> <command...>
+spinner_run() {
+    local msg="$1"; shift
+    if ! is_tty_err; then
+        "$@"
+        return $?
+    fi
+
+    "$@" &
+    local pid=$!
+    local frames=$SPIN_FRAMES
+    local rc=0 f
+
+    hide_cursor
+    trap 'show_cursor' INT TERM
+    while kill -0 "$pid" 2>/dev/null; do
+        for f in $frames; do
+            kill -0 "$pid" 2>/dev/null || break
+            printf '\r%s %s' "${C_CYAN}${f}${C_RESET}" "${C_DIM}${msg}${C_RESET}" >&2
+            sleep 0.08
+        done
+    done
+    wait "$pid"; rc=$?
+    printf '\r\033[K' >&2
+    show_cursor
+    trap - INT TERM
+    return $rc
+}
+
+confirm() {
+    [ "$ASSUME_YES" -eq 1 ] && return 0
+    local ans=''
+    printf '%s %s %s' "${C_YELLOW}?${C_RESET}" "$1" "${C_DIM}[y/N]${C_RESET} " >&2
+    read -r ans || true
+    case "$ans" in [Yy]*) return 0 ;; *) return 1 ;; esac
+}
+
+plural() { # <count> <singular> [plural]
+    if [ "$1" -eq 1 ]; then printf '%s %s' "$1" "$2"
+    else printf '%s %s' "$1" "${3:-$2s}"; fi
+}
+
+# ---------------------------------------------------------------------------
+# Git helpers
+# ---------------------------------------------------------------------------
+
+in_git_repo() { git rev-parse --is-inside-work-tree >/dev/null 2>&1; }
+
+require_git_repo() {
+    if ! in_git_repo; then
+        err "Not a git repository: $(pwd)"
+        dim "  run 'git init' first, or move into a repository"
+        return 1
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Catalog & cache
+# ---------------------------------------------------------------------------
+
+file_mtime() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null; }
+
+cache_fresh() {
+    [ -s "$1" ] || return 1
+    local m now
+    m=$(file_mtime "$1") || return 1
+    now=$(date +%s)
+    [ $((now - m)) -lt "$CACHE_TTL" ]
+}
+
+# A template name is a cache-file path component and goes into the .gitignore
+# marker line, so its shape is ours to decide, not the API's. Anything outside
+# this class - '/' and '..' above all - is not a template name, however the
+# catalog spells it. The real catalog (571 entries) is entirely within it; the
+# longest genuine name is 27 characters.
+NAME_RE='[A-Za-z0-9._+-]{1,64}'
+
+valid_name() {
+    case "$1" in
+    '' | *[!A-Za-z0-9._+-]*) return 1 ;;
+    esac
+    [ "${#1}" -le 64 ]
+}
+
+local_templates() {
+    [ -d "$RESOURCES" ] || return 0
+    local f
+    for f in "$RESOURCES"/*.gitignore; do
+        [ -e "$f" ] || return 0
+        basename "$f" .gitignore
+    done
+}
+
+ensure_catalog() {
+    mkdir -p "$CACHE_DIR" "$TPL_CACHE"
+    if [ "$REFRESH" -eq 0 ] && cache_fresh "$LIST_CACHE"; then return 0; fi
+
+    local tmp
+    tmp=$(mktemp) || return 1
+    if spinner_run "fetching the template catalog" \
+        curl -fsL --max-time 20 --proto-redir '=https' --max-redirs 5 \
+        "$API/list" -o "$tmp"; then
+        # Validate at ingest, so a poisoned catalog never reaches disk: the
+        # cache outlives the response by GSH_CACHE_TTL, and is used indefinitely
+        # whenever the API is unreachable.
+        local raw seen kept
+        raw=$(mktemp) || { rm -f "$tmp"; return 1; }
+        tr ',' '\n' < "$tmp" | tr -d ' \r' | sed '/^$/d' | sort -u > "$raw"
+        grep -Ex "$NAME_RE" "$raw" > "$LIST_CACHE"
+        seen=$(wc -l < "$raw" | tr -d ' ')
+        kept=$(wc -l < "$LIST_CACHE" | tr -d ' ')
+        [ "$seen" -eq "$kept" ] || \
+            warn "ignored $((seen - kept)) malformed name(s) in the catalog"
+        rm -f "$tmp" "$raw"
+        return 0
+    fi
+
+    rm -f "$tmp"
+    if [ -s "$LIST_CACHE" ]; then
+        warn "cannot reach gitignore.io, using the cached catalog"
+        return 0
+    fi
+    warn "cannot reach gitignore.io, only local templates are available"
+    : > "$LIST_CACHE"
+    return 0
+}
+
+catalog() {
+    # filtered on read too: a cache poisoned by an older gsh is still on disk
+    { [ -f "$LIST_CACHE" ] && cat "$LIST_CACHE"; local_templates; } |
+        grep -Ex "$NAME_RE" | sort -u
+}
+
+known_template() {
+    catalog | grep -qxF "$1"
+}
+
+emit_local() {
+    printf '\n#### %s ####\n' "$1"
+    sed 's/\r$//' "$RESOURCES/$1.gitignore"
+}
+
+# cache_key <comma-list> -> a file name that always fits in NAME_MAX (255).
+# Joining names verbatim overflows at ~26 templates, which a polyglot repo
+# reaches: both the write and the read then fail with a raw errno. Keep a
+# readable prefix for anyone browsing the cache, and let a digest of the full
+# list carry the identity.
+cache_key() {
+    local digest
+    digest=$(printf '%s' "$1" | git hash-object --stdin 2>/dev/null)
+    if [ -n "$digest" ]; then
+        printf '%.80s-%.12s' "$(printf '%s' "$1" | tr ',' '_')" "$digest"
+    else
+        # no git: fall back to prefix plus length, still bounded
+        printf '%.80s-%s' "$(printf '%s' "$1" | tr ',' '_')" "${#1}"
+    fi
+}
+
+# The response body is attacker-reachable (see the redirect hardening on the
+# curl calls). Two things it must never be:
+#   - carrying gsh's own block markers: write_block appends the body verbatim
+#     between them, and installed_templates reads them back out, so a body can
+#     otherwise forge "these templates are installed" into the user's committed
+#     .gitignore. '### <name>.gitignore ###' is the gsh 1.x marker, read back by
+#     the same function, so it is forgeable in exactly the same way.
+#   - markup: an HTML error page served with HTTP 200 currently lands in
+#     .gitignore verbatim and is then cached.
+# Genuine gitignore.io bodies contain neither (checked against node,macos /
+# python / rust / java,gradle); they open with '# Created by https://...'.
+body_is_template() {
+    if grep -qE '^### gsh:|^### .*\.gitignore ###$' "$1"; then
+        warn "the API response contains gsh block markers, refusing it"
+        return 1
+    fi
+    case "$(sed -n '/[^[:space:]]/{p;q;}' "$1")" in
+    '<'*)
+        warn "the API returned markup, not a gitignore template"
+        return 1
+        ;;
+    esac
+}
+
+# fetch_bundle <name> [name...]  -> template content on stdout
+#
+# gitignore.io is the source of truth; resources/ holds custom templates that
+# do not exist upstream, and doubles as the offline fallback.
+fetch_bundle() {
+    local names="$*" n
+    local locals='' remotes=''
+
+    for n in $names; do
+        if ! valid_name "$n"; then
+            err "invalid template name: $n"
+            return 1
+        fi
+        if [ -f "$LIST_CACHE" ] && grep -qxF "$n" "$LIST_CACHE"; then
+            remotes="$remotes $n"
+        elif [ -f "$RESOURCES/$n.gitignore" ]; then
+            locals="$locals $n"
+        else
+            err "unknown template: $n"
+            return 1
+        fi
+    done
+
+    for n in $locals; do
+        emit_local "$n"
+    done
+
+    [ -n "$remotes" ] || return 0
+
+    local joined cache
+    joined=$(printf '%s' "$remotes" | tr ' ' ',' | sed 's/^,//')
+    cache="$TPL_CACHE/$(cache_key "$joined").gitignore"
+
+    if [ "$REFRESH" -eq 1 ] || ! cache_fresh "$cache"; then
+        local tmp
+        tmp=$(mktemp) || return 1
+        if spinner_run "downloading $joined" \
+            curl -fsL --max-time 30 --proto-redir '=https' --max-redirs 5 \
+            "$API/$joined" -o "$tmp" && body_is_template "$tmp"; then
+            mkdir -p "$TPL_CACHE"
+            sed 's/\r$//' "$tmp" > "$cache"
+            rm -f "$tmp"
+        else
+            rm -f "$tmp"
+            if [ -s "$cache" ]; then
+                warn "offline: using the cached copy of $joined"
+            else
+                # last resort: any local copy of the same templates
+                local fallback='' missing=''
+                for n in $remotes; do
+                    if [ -f "$RESOURCES/$n.gitignore" ]; then
+                        fallback="$fallback $n"
+                    else
+                        missing="$missing $n"
+                    fi
+                done
+                if [ -n "$fallback" ]; then
+                    warn "offline: falling back to the local copy of${fallback}"
+                    for n in $fallback; do emit_local "$n"; done
+                fi
+                if [ -n "$missing" ]; then
+                    err "cannot download:$missing"
+                    return 1
+                fi
+                return 0
+            fi
+        fi
+    fi
+
+    cat "$cache"
+}
+
+# ---------------------------------------------------------------------------
+# .gitignore blocks
+# ---------------------------------------------------------------------------
+
+# Names from start markers that are actually closed by an end marker, with no
+# second start in between. Refusing to honour anything else matters because the
+# payload of a marker-injection lives in the *committed* .gitignore and so
+# survives a fresh clone and a healthy API; the same rule retires an orphaned
+# start marker left by a half-finished write, which would otherwise make gsh
+# refuse that template forever. Failing this way can only under-report (gsh
+# re-adds a template, doctor flags the duplicate) - it can never over-report.
+marker_names() {
+    local m pending='' paired=0 broken=0
+    while IFS= read -r m; do
+        case "$m" in
+        'S '*)
+            [ -z "$pending" ] && paired=1 || { paired=0; broken=1; }
+            pending=${m#S }
             ;;
-        [Nn]*)
-            echo -e "${RED}[ERR]${NC} Please create .gitignore manually or use gsh init"
-            exit 1
-            ;;
-        *)
-            touch .gitignore
-            echo -e "${GREEN}[OK]${NC} Creating .gitignore"
-            echo -e "${YELLOW}[IN]${NC} I continue with the installation..."
+        'E')
+            if [ -n "$pending" ] && [ "$paired" -eq 1 ]; then
+                printf '%s\n' "$pending"
+            else
+                broken=1
+            fi
+            pending=''; paired=0
             ;;
         esac
+    done <<EOF
+$(sed -n -e 's/^### gsh:start \(.*\) ###$/S \1/p' \
+         -e 's/^### gsh:end ###$/E/p' "$1")
+EOF
+    [ -z "$pending" ] || broken=1
+    [ "$broken" -eq 0 ] || warn "$1 has malformed gsh block markers, ignoring them"
+}
+
+installed_templates() {
+    [ -f .gitignore ] || return 0
+    {
+        marker_names .gitignore | tr ',' '\n'
+        # blocks written by gsh 1.x
+        sed -n 's/^### \(.*\)\.gitignore ###$/\1/p' .gitignore
+    } | tr -d ' ' | sed '/^$/d' | sort -u
+}
+
+ends_with_newline() {
+    [ -s "$1" ] || return 0
+    [ -z "$(tail -c 1 "$1")" ]
+}
+
+# '>>' follows symlinks and '[ -f ]' is true for a symlink to a file, so a repo
+# shipping '.gitignore -> ~/.zshrc' (git stores and restores symlinks) gets our
+# appends written outside the work tree. A directory named .gitignore is the
+# same class of problem: 'touch' on it succeeds and every write then fails.
+writable_gitignore() {
+    if [ -L .gitignore ]; then
+        err ".gitignore is a symlink, refusing to write through it"
+        dim "  replace it with a regular file, or run gsh where it points"
+        return 1
+    fi
+    if [ -e .gitignore ] && [ ! -f .gitignore ]; then
+        err ".gitignore exists but is not a regular file"
+        return 1
     fi
 }
 
-# Check commands
-case $1 in
-"add" | "a")
-    existFile
-    addLine $2
-    ;;
-"init" | "i")
-    if [ -f ".gitignore" ]; then
-        echo -e "${RED}[ERR]${NC} You already have a .gitignore file"
-        exit 1
-    else
-        touch .gitignore
-        echo -e "${GREEN}[OK]${NC} Creating .gitignore"
+# write_block <comma-list> < content
+write_block() {
+    local joined="$1"
+    writable_gitignore || return 1
+    if [ -s .gitignore ]; then
+        ends_with_newline .gitignore || printf '\n' >> .gitignore || return 1
+        printf '\n' >> .gitignore || return 1
     fi
-    ;;
+    {
+        printf '%s %s ###\n' "$MARK_START" "$joined"
+        cat
+        printf '%s\n' "$MARK_END"
+    } >> .gitignore || return 1
+    # The end marker is the only proof the whole block landed: a write cut short
+    # by ENOSPC or a signal dies inside 'cat', which this pipeline never sees.
+    [ "$(tail -n 1 .gitignore 2>/dev/null)" = "$MARK_END" ]
+}
 
+ensure_gitignore() {
+    writable_gitignore || return 1
+    if [ -f .gitignore ]; then return 0; fi
+    if [ "$ASSUME_YES" -eq 0 ]; then
+        confirm ".gitignore not found, create it?" || {
+            err "aborted"
+            return 1
+        }
+    fi
+    touch .gitignore || { err "cannot create .gitignore here"; return 1; }
+    ok "created .gitignore"
+}
+
+# install_templates <name> [name...]
+install_templates() {
+    local requested="$*" n
+    local installed wanted='' skipped=''
+
+    installed=$(installed_templates)
+    for n in $requested; do
+        if printf '%s\n' "$installed" | grep -qxF "$n"; then
+            skipped="$skipped $n"
+        else
+            wanted="$wanted $n"
+        fi
+    done
+
+    for n in $skipped; do
+        dim "  $I_DOT $n already present, skipped"
+    done
+
+    if [ -z "$wanted" ]; then
+        info "nothing to do"
+        return 0
+    fi
+
+    local content joined
+    content=$(fetch_bundle $wanted) || return 1
+    if [ -z "$content" ]; then
+        err "empty template, nothing written"
+        return 1
+    fi
+
+    joined=$(printf '%s' "$wanted" | tr ' ' ',' | sed 's/^,//')
+    if ! printf '%s\n' "$content" | write_block "$joined"; then
+        err "could not write the block to .gitignore, nothing was added"
+        dim "  check permissions and free space, then re-run"
+        return 1
+    fi
+
+    local count
+    count=$(printf '%s\n' "$content" | grep -cv '^[[:space:]]*\(#.*\)\?$')
+    ok "added ${C_BOLD}${joined}${C_RESET} ${C_DIM}($(plural "$count" rule))${C_RESET}"
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+cmd_version() {
+    local file="$GSH_DIR/current.txt" v='unknown'
+    [ -f "$file" ] && v=$(sed -n 's/^[Vv]ersion:[[:space:]]*//p' "$file" | head -n 1)
+    printf '%sgsh%s %s\n' "$C_BOLD" "$C_RESET" "${v:-unknown}"
+}
+
+cmd_help() {
+    printf '%sgsh%s %s- gitignore.sh%s\n\n' "$C_BOLD" "$C_RESET" "$C_DIM" "$C_RESET"
+    printf '%sUsage:%s gsh <command> [args]\n\n' "$C_BOLD" "$C_RESET"
+    printf '%sCommands:%s\n' "$C_BOLD" "$C_RESET"
+    printf '  %-22s %s\n' "init, i"          "create an empty .gitignore (requires a git repo)"
+    printf '  %-22s %s\n' "auto"             "detect the project stack and build .gitignore"
+    printf '  %-22s %s\n' "add, a <tpl...>"  "add one or more templates"
+    printf '  %-22s %s\n' "doctor, doc"      "check the repo for gitignore problems"
+    printf '  %-22s %s\n' "list, l [filter]" "list the available templates"
+    printf '  %-22s %s\n' "show <tpl>"       "print a template without installing it"
+    printf '  %-22s %s\n' "version, v"       "show the installed version"
+    printf '  %-22s %s\n' "help, h"          "show this message"
+    printf '\n%sOptions:%s\n' "$C_BOLD" "$C_RESET"
+    printf '  %-22s %s\n' "-y, --yes"    "assume yes, never prompt"
+    printf '  %-22s %s\n' "--refresh"    "ignore the cache and refetch"
+    printf '  %-22s %s\n' "--no-color"   "disable colors"
+    printf '  %-22s %s\n' "--ascii"      "ASCII icons instead of unicode"
+    printf '\n%sExamples:%s\n' "$C_BOLD" "$C_RESET"
+    dim "  gsh auto                 # the usual one-liner after git init"
+    dim "  gsh add node macos       # explicit templates, one request"
+    dim "  gsh doctor               # \"did I commit node_modules again?\""
+    dim "  gsh list rust"
+}
+
+cmd_init() {
+    require_git_repo || return 1
+    writable_gitignore || return 1
+    if [ -f .gitignore ]; then
+        err "you already have a .gitignore file"
+        return 1
+    fi
+    touch .gitignore || { err "cannot create .gitignore here"; return 1; }
+    ok "created .gitignore"
+    dim "  next: gsh auto"
+}
+
+cmd_list() {
+    local filter="${1:-}" out
+    ensure_catalog
+    out=$(catalog)
+    if [ -n "$filter" ]; then
+        out=$(printf '%s\n' "$out" | grep -i -- "$filter") || {
+            err "no template matches '$filter'"
+            return 1
+        }
+    fi
+
+    local n
+    n=$(printf '%s\n' "$out" | sed '/^$/d' | wc -l | tr -d ' ')
+    if [ -n "$filter" ]; then
+        info "$n templates matching ${C_BOLD}${filter}${C_RESET}"
+    else
+        info "$n templates available ${C_DIM}(gsh list <filter> to search)${C_RESET}"
+    fi
+
+    if is_tty && command -v column >/dev/null 2>&1; then
+        printf '%s\n' "$out" | column -c "${COLUMNS:-80}"
+    else
+        printf '%s\n' "$out"
+    fi
+}
+
+cmd_show() {
+    local name="${1:-}"
+    [ -n "$name" ] || { err "usage: gsh show <template>"; return 1; }
+    ensure_catalog
+    known_template "$name" || { err "unknown template: $name"; return 1; }
+    fetch_bundle "$name"
+}
+
+cmd_add() {
+    [ $# -gt 0 ] || {
+        err "no template given"
+        dim "  usage: gsh add <template> [template...]   (gsh list to browse)"
+        return 1
+    }
+    ensure_catalog
+    local n bad=''
+    for n in "$@"; do
+        known_template "$n" || bad="$bad $n"
+    done
+    if [ -n "$bad" ]; then
+        err "unknown template(s):$bad"
+        dim "  try: gsh list ${bad# }"
+        return 1
+    fi
+    ensure_gitignore || return 1
+    install_templates "$@"
+}
+
+# --- auto ------------------------------------------------------------------
+
+# prints "template<TAB>reason" for everything detected here
+detect_stack() {
+    local d
+    d() { printf '%s\t%s\n' "$1" "$2"; }
+
+    [ -f package.json ]     && d node "package.json"
+    [ -f yarn.lock ]        && d node "yarn.lock"
+    [ -f pnpm-lock.yaml ]   && d node "pnpm-lock.yaml"
+    [ -d node_modules ]     && d node "node_modules/"
+    ls next.config.* >/dev/null 2>&1 && d nextjs "next.config.*"
+    ls nuxt.config.* >/dev/null 2>&1 && d nuxtjs "nuxt.config.*"
+    [ -f angular.json ]     && d angular "angular.json"
+    [ -f svelte.config.js ] && d node "svelte.config.js"
+
+    [ -f pyproject.toml ]    && d python "pyproject.toml"
+    [ -f requirements.txt ]  && d python "requirements.txt"
+    [ -f setup.py ]          && d python "setup.py"
+    [ -f Pipfile ]           && d python "Pipfile"
+    [ -d .venv ] || [ -d venv ] && d python "virtualenv"
+    [ -f manage.py ]         && d django "manage.py"
+
+    [ -f Cargo.toml ]   && d rust "Cargo.toml"
+    [ -f go.mod ]       && d go "go.mod"
+    [ -f pom.xml ]      && d maven "pom.xml"
+    ls build.gradle* >/dev/null 2>&1 && d gradle "build.gradle"
+    [ -f pom.xml ] || ls build.gradle* >/dev/null 2>&1 && d java "jvm project"
+    [ -f Gemfile ]      && d ruby "Gemfile"
+    [ -f config/application.rb ] && d rails "config/application.rb"
+    [ -f composer.json ] && d composer "composer.json"
+    [ -f artisan ]      && d laravel "artisan"
+    [ -f pubspec.yaml ] && d dart "pubspec.yaml"
+    [ -f CMakeLists.txt ] && d cmake "CMakeLists.txt"
+    [ -f Package.swift ] && d swift "Package.swift"
+    [ -f Podfile ]      && d cocoapods "Podfile"
+    ls *.xcodeproj >/dev/null 2>&1 && d xcode "*.xcodeproj"
+    ls *.sln *.csproj >/dev/null 2>&1 && d visualstudio "*.sln / *.csproj"
+    ls *.tf >/dev/null 2>&1 && d terraform "*.tf"
+    ls *.tex >/dev/null 2>&1 && d latex "*.tex"
+    [ -d Assets ] && [ -d ProjectSettings ] && d unity "Unity project"
+
+    [ -d .vscode ] && d visualstudiocode ".vscode/"
+    [ -d .idea ]   && d jetbrains ".idea/"
+
+    case "$(uname -s 2>/dev/null)" in
+    Darwin) d macos "you are on macOS" ;;
+    Linux)  d linux "you are on Linux" ;;
+    MINGW* | MSYS* | CYGWIN*) d windows "you are on Windows" ;;
+    esac
+}
+
+cmd_auto() {
+    ensure_catalog
+
+    local found
+    found=$(detect_stack | sort -u)
+
+    if [ -z "$found" ]; then
+        warn "no known stack detected in $(pwd)"
+        dim "  add templates by hand: gsh add <template>"
+        return 1
+    fi
+
+    local installed names='' seen='' name reason
+    installed=$(installed_templates)
+
+    title "Detected"
+    while IFS=$'\t' read -r name reason; do
+        [ -n "$name" ] || continue
+        # a name detect_stack emits but the catalog does not have is our bug,
+        # not the user's: say so instead of dropping the detection silently
+        known_template "$name" || {
+            warn "skipping '$name' ($reason): no such template available"
+            continue
+        }
+        # one line per template, even when several files point at it
+        case " $seen " in
+        *" $name "*) continue ;;
+        esac
+        seen="$seen $name"
+        if printf '%s\n' "$installed" | grep -qxF "$name"; then
+            printf '  %s %-18s %s\n' "${C_DIM}${I_DOT}${C_RESET}" "$name" \
+                "${C_DIM}${reason} - already present${C_RESET}"
+            continue
+        fi
+        names="$names $name"
+        printf '  %s %-18s %s\n' "${C_GREEN}${I_OK}${C_RESET}" "$name" "${C_DIM}${reason}${C_RESET}"
+    done <<EOF
+$found
+EOF
+
+    if [ -z "$names" ]; then
+        printf '\n'
+        info "everything already in .gitignore, nothing to do"
+        return 0
+    fi
+
+    printf '\n'
+    local joined
+    joined=$(printf '%s' "$names" | sed 's/^ //' | tr ' ' ',')
+    confirm "Add ${C_BOLD}${joined}${C_RESET} to .gitignore?" || { info "aborted"; return 0; }
+
+    ensure_gitignore || return 1
+    install_templates $names
+}
+
+# --- doctor ----------------------------------------------------------------
+
+SECRET_PATTERNS='.env .env.* *.pem *.key *.p12 *.pfx id_rsa id_dsa id_ecdsa id_ed25519 credentials.json service-account*.json .npmrc .pypirc'
+
+cmd_doctor() {
+    require_git_repo || return 1
+
+    local problems=0 warnings=0
+
+    title "gitignore"
+    if [ -f .gitignore ]; then
+        local rules
+        rules=$(grep -cv '^[[:space:]]*\(#.*\)\?$' .gitignore)
+        ok ".gitignore found ${C_DIM}($(plural "$rules" rule))${C_RESET}"
+        local tpls
+        tpls=$(installed_templates | tr '\n' ' ')
+        [ -n "$tpls" ] && dot "templates: ${C_DIM}${tpls}${C_RESET}"
+    else
+        warn "no .gitignore in this repository"
+        dim "  fix: gsh auto"
+        warnings=$((warnings + 1))
+    fi
+
+    # --- tracked files that the .gitignore says should be ignored -----------
+    title "Tracked files that should be ignored"
+    local tracked_ignored count_ti
+    tracked_ignored=$(git ls-files -i -c --exclude-standard 2>/dev/null)
+    if [ -n "$tracked_ignored" ]; then
+        count_ti=$(printf '%s\n' "$tracked_ignored" | wc -l | tr -d ' ')
+        err "$(plural "$count_ti" 'tracked file' 'tracked files') matching .gitignore but still in the index"
+        printf '%s\n' "$tracked_ignored" | head -n 10 | while read -r f; do
+            dot "$f"
+        done
+        [ "$count_ti" -gt 10 ] && dim "    ... and $((count_ti - 10)) more"
+        printf '\n'
+        dim "  .gitignore does nothing for files git already tracks."
+        dim "  Remove them from the index (they stay on disk):"
+        printf '    %sgit rm -r --cached <path>%s\n' "$C_CYAN" "$C_RESET"
+        problems=$((problems + 1))
+    else
+        ok "none"
+    fi
+
+    # --- secrets that are NOT ignored ---------------------------------------
+    title "Secrets"
+    local -a visible
+    local secrets='' p f state base n=0
+    # -z survives paths git would C-quote (non-ASCII, backslash, quote, newline)
+    while IFS= read -r -d '' f; do
+        n=$((n + 1))
+        visible[n]="$f"
+    done < <( { git ls-files -z -c 2>/dev/null; git ls-files -z -o --exclude-standard 2>/dev/null; } | sort -z -u )
+    set -f # SECRET_PATTERNS are match patterns, not globs to expand against cwd
+    for f in ${visible[@]+"${visible[@]}"}; do
+        base=${f##*/}
+        for p in $SECRET_PATTERNS; do
+            case "$base" in
+            $p) ;;
+            *) continue ;;
+            esac
+            if git ls-files --error-unmatch -- "$f" >/dev/null 2>&1; then
+                state=tracked
+            else
+                state=exposed
+            fi
+            secrets="$secrets$state	$f
+"
+            break
+        done
+    done
+    set +f
+    secrets=$(printf '%s' "$secrets" | sed '/^$/d' | sort -u)
+    if [ -n "$secrets" ]; then
+        local n_tracked n_exposed
+        n_tracked=$(printf '%s\n' "$secrets" | grep -c '^tracked' || true)
+        n_exposed=$(printf '%s\n' "$secrets" | grep -c '^exposed' || true)
+
+        if [ "$n_tracked" -gt 0 ]; then
+            err "$(plural "$n_tracked" 'sensitive file is' 'sensitive files are') COMMITTED to this repo"
+            printf '%s\n' "$secrets" | grep '^tracked' | cut -f2 | while read -r f; do dot "$f"; done
+            printf '\n'
+            dim "  these are already in git history - rotate the credentials, then:"
+            printf '    %sgit rm --cached <path>%s\n' "$C_CYAN" "$C_RESET"
+            printf '\n'
+            problems=$((problems + 1))
+        fi
+        if [ "$n_exposed" -gt 0 ]; then
+            err "$(plural "$n_exposed" 'sensitive file is' 'sensitive files are') not ignored"
+            printf '%s\n' "$secrets" | grep '^exposed' | cut -f2 | while read -r f; do dot "$f"; done
+            printf '\n'
+            dim "  fix: gsh add dotenv   ${I_ARROW}   or add the pattern by hand"
+            problems=$((problems + 1))
+        fi
+    else
+        ok "no exposed secrets found"
+    fi
+
+    # --- big files that are not ignored -------------------------------------
+    title "Large files"
+    local big='' size
+    for f in ${visible[@]+"${visible[@]}"}; do
+        [ -f "$f" ] || continue
+        size=$(wc -c < "$f" 2>/dev/null | tr -d ' ')
+        [ -n "$size" ] || continue
+        if [ "$size" -gt 5242880 ]; then
+            big="$big$(printf '%6sMB  %s' "$((size / 1048576))" "$f")
+"
+        fi
+    done
+    big=$(printf '%s' "$big" | sed '/^$/d')
+    if [ -n "$big" ]; then
+        warn "$(plural "$(printf '%s\n' "$big" | wc -l | tr -d ' ')" 'file' 'files') over 5MB not ignored"
+        printf '%s\n' "$big" | head -n 5 | while read -r line; do dot "$line"; done
+        warnings=$((warnings + 1))
+    else
+        ok "none over 5MB"
+    fi
+
+    # --- duplicate rules ----------------------------------------------------
+    if [ -f .gitignore ]; then
+        title "Duplicates"
+        local dups
+        dups=$(grep -v '^[[:space:]]*\(#.*\)\?$' .gitignore | sort | uniq -d)
+        if [ -n "$dups" ]; then
+            warn "$(plural "$(printf '%s\n' "$dups" | wc -l | tr -d ' ')" 'duplicated rule')"
+            printf '%s\n' "$dups" | head -n 5 | while read -r line; do dot "$line"; done
+            warnings=$((warnings + 1))
+        else
+            ok "no duplicated rules"
+        fi
+    fi
+
+    # --- summary ------------------------------------------------------------
+    printf '\n'
+    if [ "$problems" -gt 0 ]; then
+        printf '%s %s, %s\n' "${C_RED}${I_ERR}${C_RESET}" "$(plural "$problems" problem)" "$(plural "$warnings" warning)"
+        return 1
+    elif [ "$warnings" -gt 0 ]; then
+        printf '%s %s, nothing critical\n' "${C_YELLOW}${I_WARN}${C_RESET}" "$(plural "$warnings" warning)"
+        return 0
+    fi
+    printf '%s %s\n' "${C_GREEN}${I_OK}${C_RESET}" "all good"
+}
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+POS=''
+POS_N=0
+set_pos() { POS_N=$((POS_N + 1)); eval "POS_$POS_N=\$1"; }
+
+parsed=''
+while [ $# -gt 0 ]; do
+    case "$1" in
+    -y | --yes)   ASSUME_YES=1 ;;
+    --no-color)   NO_COLOR_FLAG=1 ;;
+    --ascii)      ASCII_FLAG=1 ;;
+    --refresh)    REFRESH=1 ;;
+    -h | --help)  set_pos "help" ;;
+    -v | --version) set_pos "version" ;;
+    --) shift; while [ $# -gt 0 ]; do set_pos "$1"; shift; done; break ;;
+    *) set_pos "$1" ;;
+    esac
+    [ $# -gt 0 ] && shift
+done
+
+setup_style
+
+set --
+i=1
+while [ "$i" -le "$POS_N" ]; do
+    eval "set -- \"\$@\" \"\$POS_$i\""
+    i=$((i + 1))
+done
+
+case "${1:-help}" in
+"init" | "i")        shift 2>/dev/null; cmd_init ;;
+"auto")              shift 2>/dev/null; cmd_auto ;;
+"add" | "a")         shift; cmd_add "$@" ;;
+"doctor" | "doc")    shift 2>/dev/null; cmd_doctor ;;
+"list" | "l")        shift; cmd_list "${1:-}" ;;
+"show")              shift; cmd_show "${1:-}" ;;
+"version" | "v")     cmd_version ;;
+"help" | "h")        cmd_help ;;
 *)
-    echo -e "Usage: $0 {addLine|existFile|addCustom|removeCustom}"
+    err "unknown command: $1"
+    printf '\n'
+    cmd_help
+    exit 1
     ;;
 esac

@@ -1,18 +1,402 @@
 #!/bin/bash
+#
+# gsh installer - adds the gsh / gsh-update aliases to your shell rc file.
+#
+# The aliases live inside a delimited, managed block:
+#
+#     # >>> gsh >>>
+#     alias gsh='bash "/path/to/gsh/gsh/main"'
+#     alias gsh-update='bash "/path/to/gsh/update"'
+#     # <<< gsh <<<
+#
+# so re-running setup rewrites that block in place instead of appending a
+# second copy, and an alias left behind by an older installer can be
+# superseded safely.  The block is always written last, so it wins.
+#
+# exit codes:  0 ok   1 error (unsupported shell, unwritable rc file, ...)
+#
 
-# colors
-BASH_COLOR='\033[1;33m'
-ZSH_COLOR='\033[1;34m'
+set -u
 
-# check if the shell is zsh or bash
-if [ -n "$ZSH_VERSION" ]; then
-    echo -e "${ZSH_COLOR} zsh detected"
-    echo "alias gsh = sh ~/gsh/ghs/main " >> ~/.zshrc
-    echo "alias gsh-update = sh ~/gsh/update" >> ~/.zshrc
-    source ~/.zshrc
+GSH_DIR=$(cd "$(dirname "$0")" && pwd)
+
+MARK_START='# >>> gsh >>>'
+MARK_END='# <<< gsh <<<'
+
+ASSUME_YES=0
+DRY_RUN=0
+NO_COLOR_FLAG=0
+ASCII_FLAG=0
+SHOW_HELP=0
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+    -h | --help) SHOW_HELP=1 ;;
+    -y | --yes) ASSUME_YES=1 ;;
+    --dry-run) DRY_RUN=1 ;;
+    --no-color) NO_COLOR_FLAG=1 ;;
+    --ascii) ASCII_FLAG=1 ;;
+    *)
+        printf 'setup: unknown option: %s\n' "$1" >&2
+        printf "setup: run 'bash setup --help' for usage\n" >&2
+        exit 1
+        ;;
+    esac
+    shift
+done
+
+# --- style -----------------------------------------------------------------
+use_color() {
+    [ "$NO_COLOR_FLAG" -eq 0 ] || return 1
+    # no-color.org: the variable disables colour by its presence, not its value
+    [ -z "${NO_COLOR+x}" ] || return 1
+    [ "${TERM:-}" != "dumb" ] || return 1
+    [ -t 1 ]
+}
+
+use_unicode() {
+    [ "$ASCII_FLAG" -eq 0 ] || return 1
+    [ -z "${GSH_ASCII:-}" ] || return 1
+    local loc="${LC_ALL:-${LC_CTYPE:-${LANG:-}}}"
+    # no locale set at all: modern terminals are UTF-8, assume so
+    [ -n "$loc" ] || return 0
+    case "$loc" in
+    *[Uu][Tt][Ff]*) return 0 ;;
+    *) return 1 ;;
+    esac
+}
+
+if use_color; then
+    C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'
+    C_RED=$'\033[0;31m'; C_GREEN=$'\033[0;32m'; C_YELLOW=$'\033[0;33m'
+    C_BLUE=$'\033[0;34m'
 else
-    echo -e "${BASH_COLOR} bash detected"
-    echo "alias gsh = sh ~/gsh/ghs/main " >> ~/.bashrc
-    echo "alias gsh-update = 'sh ~/gsh/update'" >> ~/.bashrc
-    source ~/.bashrc
+    C_RESET=''; C_BOLD=''; C_DIM=''; C_RED=''; C_GREEN=''; C_YELLOW=''; C_BLUE=''
 fi
+
+if use_unicode; then
+    I_OK='✓'; I_ERR='✗'; I_INFO='›'; I_DOT='•'; I_ASK='?'
+else
+    I_OK='+'; I_ERR='x'; I_INFO='>'; I_DOT='*'; I_ASK='?'
+fi
+
+ok()   { printf '%s %s\n' "${C_GREEN}${I_OK}${C_RESET}" "$*"; }
+err()  { printf '%s %s\n' "${C_RED}${I_ERR}${C_RESET}" "$*" >&2; }
+info() { printf '%s %s\n' "${C_BLUE}${I_INFO}${C_RESET}" "$*"; }
+dot()  { printf '  %s %s\n' "${C_DIM}${I_DOT}${C_RESET}" "$*"; }
+dim()  { printf '%s\n' "${C_DIM}$*${C_RESET}"; }
+
+usage() {
+    printf '%sgsh setup%s %s- install the gsh aliases into your shell rc file%s\n\n' \
+        "$C_BOLD" "$C_RESET" "$C_DIM" "$C_RESET"
+    printf '%sUsage%s\n' "$C_BOLD" "$C_RESET"
+    printf '  bash setup [options]\n\n'
+    printf '%sOptions%s\n' "$C_BOLD" "$C_RESET"
+    printf '  -y, --yes       comment out a conflicting alias without asking\n'
+    printf '      --dry-run   report what would change, write nothing\n'
+    printf '      --no-color  plain output (NO_COLOR is honoured too)\n'
+    printf '      --ascii     ASCII icons (GSH_ASCII is honoured too)\n'
+    printf '  -h, --help      show this help\n\n'
+    printf '%sWhat it does%s\n' "$C_BOLD" "$C_RESET"
+    printf '  Detects your login shell from $SHELL, then writes a managed block\n'
+    printf '  to ~/.zshrc or ~/.bashrc (~/.bash_profile if that is the only one):\n\n'
+    printf '    %s\n' "$MARK_START"
+    printf '    %s\n' "$ALIAS_GSH"
+    printf '    %s\n' "$ALIAS_UPD"
+    printf '    %s\n\n' "$MARK_END"
+    printf '  Re-running rewrites that block in place - it never appends a second\n'
+    printf '  copy, and it repairs an rc file that is missing its final newline.\n\n'
+    printf '%sExamples%s\n' "$C_BOLD" "$C_RESET"
+    printf '  bash setup                 # install / repair\n'
+    printf '  bash setup --dry-run       # see what it would change\n'
+    printf '  bash setup --yes           # unattended, replaces a stale alias\n\n'
+    printf '%sExit codes%s\n' "$C_BOLD" "$C_RESET"
+    printf '  0  installed, or already up to date\n'
+    printf '  1  unsupported shell, unwritable rc file, or a damaged managed block\n'
+}
+
+# --- the alias lines -------------------------------------------------------
+# The block is shell source, so the install path has to survive two layers of
+# quoting: '...' around the whole alias body and "..." around the path.
+quote_path() {
+    printf '%s' "$1" | sed -e 's/[\\"$`]/\\&/g' -e "s/'/'\\\\''/g"
+}
+
+Q_DIR=$(quote_path "$GSH_DIR")
+ALIAS_GSH="alias gsh='bash \"$Q_DIR/gsh/main\"'"
+ALIAS_UPD="alias gsh-update='bash \"$Q_DIR/update\"'"
+
+block_body() {
+    printf '%s\n' "$MARK_START"
+    printf '%s\n' "# managed by the gsh installer - re-run setup to update this block"
+    printf '%s\n' "$ALIAS_GSH"
+    printf '%s\n' "$ALIAS_UPD"
+    printf '%s\n' "$MARK_END"
+}
+
+if [ "$SHOW_HELP" -eq 1 ]; then
+    usage
+    exit 0
+fi
+
+printf '\n%sgsh%s %s- gitignore.sh%s\n\n' "$C_BOLD" "$C_RESET" "$C_DIM" "$C_RESET"
+
+# --- detect the login shell ------------------------------------------------
+# this script always runs under bash, so $ZSH_VERSION would never be set here
+case "$(basename "${SHELL:-}")" in
+zsh)
+    info "zsh detected"
+    RC_FILE="$HOME/.zshrc"
+    ;;
+bash)
+    info "bash detected"
+    if [ -f "$HOME/.bash_profile" ] && [ ! -f "$HOME/.bashrc" ]; then
+        RC_FILE="$HOME/.bash_profile"
+    else
+        RC_FILE="$HOME/.bashrc"
+    fi
+    ;;
+*)
+    err "unsupported shell: ${SHELL:-unknown}"
+    dim "  add these lines to your shell rc file by hand:"
+    dim "    $ALIAS_GSH"
+    dim "    $ALIAS_UPD"
+    exit 1
+    ;;
+esac
+
+# --- make sure we can actually write ---------------------------------------
+if [ ! -e "$RC_FILE" ]; then
+    RC_DIR=$(dirname "$RC_FILE")
+    if [ ! -d "$RC_DIR" ]; then
+        err "cannot create $RC_FILE: $RC_DIR does not exist"
+        dim "  fix: mkdir -p \"$RC_DIR\" && bash setup"
+        exit 1
+    fi
+    if [ ! -w "$RC_DIR" ]; then
+        err "cannot create $RC_FILE: $RC_DIR is not writable"
+        dim "  fix: check the permissions on $RC_DIR, then re-run bash setup"
+        exit 1
+    fi
+    if [ "$DRY_RUN" -eq 0 ] && ! : >"$RC_FILE"; then
+        err "cannot create $RC_FILE"
+        exit 1
+    fi
+fi
+
+if [ -e "$RC_FILE" ] && [ ! -w "$RC_FILE" ]; then
+    err "cannot write to $RC_FILE (permission denied)"
+    dim "  fix: chmod u+w \"$RC_FILE\" && bash setup"
+    dim "  or add these lines by hand:"
+    dim "    $ALIAS_GSH"
+    dim "    $ALIAS_UPD"
+    exit 1
+fi
+
+# a dry run against a not-yet-created rc file has nothing to read
+[ -e "$RC_FILE" ] || RC_FILE_MISSING=1
+: "${RC_FILE_MISSING:=0}"
+if [ "$RC_FILE_MISSING" -eq 1 ]; then
+    RC_READ="/dev/null"
+else
+    RC_READ="$RC_FILE"
+fi
+
+# --- refuse to guess at a half-deleted block -------------------------------
+HAS_START=0
+HAS_END=0
+grep -qF -- "$MARK_START" "$RC_READ" && HAS_START=1
+grep -qF -- "$MARK_END" "$RC_READ" && HAS_END=1
+if [ "$HAS_START" -ne "$HAS_END" ]; then
+    if [ "$HAS_START" -eq 1 ]; then
+        err "$RC_FILE has a '$MARK_START' marker with no matching '$MARK_END'"
+    else
+        err "$RC_FILE has a '$MARK_END' marker with no matching '$MARK_START'"
+    fi
+    dim "  setup will not guess where the block ends."
+    dim "  fix: delete the leftover marker line from $RC_FILE, then re-run bash setup"
+    exit 1
+fi
+
+# --- find aliases that live outside the managed block ----------------------
+list_conflicts() {
+    awk -v s="$MARK_START" -v e="$MARK_END" -v a1="$ALIAS_GSH" -v a2="$ALIAS_UPD" '
+        $0 == s { inblock = 1 }
+        $0 == e { inblock = 0; next }
+        inblock { next }
+        /^[[:space:]]*alias[[:space:]]+gsh(-update)?=/ {
+            if ($0 == a1 || $0 == a2) next
+            printf "%d\t%s\n", NR, $0
+        }
+    ' "$RC_READ"
+}
+
+# an alias glued onto the end of another line is the signature of the old
+# installer appending to a file with no final newline. We cannot guess where
+# the split belongs, but we can stop the user hunting for it.
+list_mangled() {
+    awk -v s="$MARK_START" -v e="$MARK_END" '
+        $0 == s { inblock = 1 }
+        $0 == e { inblock = 0; next }
+        inblock { next }
+        /alias[[:space:]]*gsh(-update)?=/ && $0 !~ /^[[:space:]]*(#|alias[[:space:]])/ {
+            printf "%d\t%s\n", NR, $0
+        }
+    ' "$RC_READ"
+}
+
+MANGLED=$(list_mangled)
+
+CONFLICTS=$(list_conflicts)
+N_CONFLICTS=0
+if [ -n "$CONFLICTS" ]; then
+    N_CONFLICTS=$(printf '%s\n' "$CONFLICTS" | grep -c .)
+fi
+
+DROP_CONFLICTS=0
+if [ "$N_CONFLICTS" -gt 0 ]; then
+    printf '%s\n' "$CONFLICTS" | while IFS='	' read -r lineno line; do
+        dot "${C_YELLOW}stale alias${C_RESET} at $RC_FILE:$lineno"
+        dim "      $line"
+    done
+    if [ "$ASSUME_YES" -eq 1 ]; then
+        DROP_CONFLICTS=1
+    elif [ -t 0 ]; then
+        printf '%s %s' "${C_YELLOW}${I_ASK}${C_RESET}" \
+            "comment it out and let gsh manage the alias? [Y/n] "
+        if read -r reply; then
+            case "$reply" in
+            "" | [Yy]*) DROP_CONFLICTS=1 ;;
+            *) DROP_CONFLICTS=0 ;;
+            esac
+        fi
+    fi
+fi
+
+# --- build what the rc file should look like -------------------------------
+TMPDIR_GSH=$(mktemp -d) || {
+    err "cannot create a temporary directory"
+    exit 1
+}
+trap 'rm -rf "$TMPDIR_GSH"' EXIT
+
+STAMP=$(date +%Y-%m-%d)
+
+# strip any existing managed block, drop alias lines that the block re-adds
+# verbatim, optionally comment out the ones that point somewhere else, and
+# trim trailing blank lines so repeated runs stay byte-stable.
+awk -v s="$MARK_START" -v e="$MARK_END" \
+    -v a1="$ALIAS_GSH" -v a2="$ALIAS_UPD" \
+    -v drop="$DROP_CONFLICTS" -v stamp="$STAMP" '
+    function flush_blanks(   i) { for (i = 1; i <= nb; i++) print blank[i]; nb = 0 }
+    $0 == s { inblock = 1; next }
+    $0 == e { inblock = 0; next }
+    inblock { next }
+    /^[[:space:]]*$/ { blank[++nb] = $0; next }
+    {
+        if ($0 ~ /^[[:space:]]*alias[[:space:]]+gsh(-update)?=/) {
+            if ($0 == a1 || $0 == a2) next
+            if (drop == "1") {
+                flush_blanks()
+                print "# gsh setup " stamp ": superseded by the managed block below"
+                print "#" $0
+                next
+            }
+        }
+        flush_blanks()
+        print
+    }
+' "$RC_READ" >"$TMPDIR_GSH/kept" || {
+    err "cannot read $RC_FILE"
+    exit 1
+}
+
+{
+    cat "$TMPDIR_GSH/kept"
+    [ -s "$TMPDIR_GSH/kept" ] && printf '\n'
+    block_body
+} >"$TMPDIR_GSH/new" || {
+    err "cannot stage the new $RC_FILE"
+    exit 1
+}
+
+# --- apply -----------------------------------------------------------------
+CHANGED=1
+if [ "$RC_FILE_MISSING" -eq 0 ] && cmp -s "$TMPDIR_GSH/new" "$RC_FILE"; then
+    CHANGED=0
+fi
+
+if [ "$DRY_RUN" -eq 1 ]; then
+    if [ "$CHANGED" -eq 0 ]; then
+        dot "no changes needed"
+    else
+        dot "would write the managed block to $RC_FILE:"
+        block_body | while IFS= read -r l; do dim "      $l"; done
+        if [ "$N_CONFLICTS" -gt 0 ]; then
+            if [ "$DROP_CONFLICTS" -eq 1 ]; then
+                dot "would comment out $N_CONFLICTS stale alias line(s)"
+            else
+                dot "would leave $N_CONFLICTS stale alias line(s) in place"
+            fi
+        fi
+    fi
+    printf '\n'
+    info "dry run, nothing was written"
+    printf '\n'
+    exit 0
+fi
+
+chmod +x "$GSH_DIR/gsh/main" "$GSH_DIR/update" 2>/dev/null
+
+BACKUP=""
+if [ "$CHANGED" -eq 1 ]; then
+    if [ -s "$RC_FILE" ]; then
+        BACKUP="$RC_FILE.gsh-backup-$(date +%Y%m%d%H%M%S)"
+        cp "$RC_FILE" "$BACKUP" || {
+            err "cannot back up $RC_FILE to $BACKUP, nothing was changed"
+            exit 1
+        }
+    fi
+    # cat, not mv: keeps the inode, the permissions and any symlink intact
+    if ! cat "$TMPDIR_GSH/new" >"$RC_FILE"; then
+        err "cannot write $RC_FILE"
+        [ -n "$BACKUP" ] && dim "  your original file is still at $BACKUP"
+        exit 1
+    fi
+    ok "alias ${C_BOLD}gsh${C_RESET}"
+    ok "alias ${C_BOLD}gsh-update${C_RESET}"
+else
+    dot "aliases already installed, rc file left unchanged"
+fi
+
+if [ -n "$MANGLED" ]; then
+    printf '\n'
+    err "$RC_FILE has a gsh alias glued onto the end of another line"
+    printf '%s\n' "$MANGLED" | while IFS='	' read -r lineno line; do
+        dim "    $RC_FILE:$lineno"
+        dim "      $line"
+    done
+    dim "  an older gsh installer appended without a newline and joined two lines."
+    dim "  setup will not guess where to split it."
+    dim "  fix: open $RC_FILE and put that alias on its own line (or delete it -"
+    dim "       the managed block above already provides it)."
+fi
+
+if [ "$N_CONFLICTS" -gt 0 ] && [ "$DROP_CONFLICTS" -eq 0 ]; then
+    printf '\n'
+    err "left $N_CONFLICTS alias line(s) that do not point at this install"
+    dim "  the managed block is written last, so 'gsh' still resolves here,"
+    dim "  but the stale line will confuse the next person who reads $RC_FILE."
+    dim "  fix: bash setup --yes    (comments the old line out)"
+    dim "   or: edit $RC_FILE by hand"
+fi
+
+printf '\n'
+ok "installed in ${C_BOLD}${GSH_DIR}${C_RESET}"
+dim "  rc file: $RC_FILE"
+[ -n "$BACKUP" ] && dim "  backup:  $BACKUP"
+printf '\n'
+info "run ${C_BOLD}source $RC_FILE${C_RESET} (or open a new terminal), then:"
+dim "    gsh auto      # in any project"
+dim "    gsh doctor    # audit the repo"
+printf '\n'
