@@ -684,62 +684,303 @@ cmd_add() {
 
 # --- auto ------------------------------------------------------------------
 
-# prints "template<TAB>reason" for everything detected here
+# The detection table, read by detect_stack. One rule per line:
+#
+#     <template>[ <template>...]|<strength>|<glob>
+#
+# <glob> is matched against the *tail* of every path in the repository, so a
+# marker counts wherever it lives: 'package.json' matches 'package.json' and
+# 'frontend/package.json' alike. That is the whole point - a monorepo keeps its
+# manifests in subtrees, and looking only at the front door found nothing.
+# detect_stack also boils these globs down to a set of literals, so one grep
+# can cut the whole file list to candidates before bash sees any of it.
+#
+# <strength> drives the noise rule:
+#   strong - a project manifest. Somebody wrote 'Cargo.toml' on purpose; that
+#            is a Rust crate no matter which subtree it sits in.
+#   weak   - a bare file extension. '*.tf' says as much about the project as
+#            it does about somebody's test data, so weak markers found ONLY
+#            under a test/fixture/example directory are discarded.
+#
+# Every template name here must exist in the catalog; cmd_auto warns and drops
+# the ones that do not, which is how a typo shows up instead of vanishing.
+SCAN_RULES='node|strong|package.json
+node|strong|package-lock.json
+node|strong|yarn.lock
+node|strong|pnpm-lock.yaml
+nextjs|strong|next.config.*
+nuxtjs|strong|nuxt.config.*
+angular|strong|angular.json
+svelte|strong|svelte.config.*
+astro|strong|astro.config.*
+reactnative|strong|react-native.config.*
+reactnative|strong|metro.config.*
+deno|strong|deno.json
+deno|strong|deno.jsonc
+deno|strong|deno.lock
+python|strong|pyproject.toml
+python|strong|requirements.txt
+python|strong|setup.py
+python|strong|Pipfile
+django|strong|manage.py
+jupyternotebooks|weak|*.ipynb
+rust|strong|Cargo.toml
+go|strong|go.mod
+maven java|strong|pom.xml
+gradle java|strong|build.gradle
+gradle java kotlin|strong|build.gradle.kts
+kotlin|strong|settings.gradle.kts
+scala sbt|strong|build.sbt
+elixir|strong|mix.exs
+phoenix|strong|*_web/router.ex
+haskell|strong|stack.yaml
+haskell|strong|*.cabal
+julia|strong|Manifest.toml
+julia|weak|Project.toml
+r|strong|*.Rproj
+r|strong|renv.lock
+nim|strong|*.nimble
+zig|strong|build.zig
+ruby|strong|Gemfile
+rails|strong|config/application.rb
+composer|strong|composer.json
+laravel|strong|artisan
+dart|strong|pubspec.yaml
+cmake|strong|CMakeLists.txt
+swift|strong|Package.swift
+cocoapods|strong|Podfile
+xcode|strong|project.pbxproj
+visualstudio|weak|*.sln
+visualstudio|weak|*.csproj
+unity|strong|ProjectSettings/ProjectVersion.txt
+godot|strong|project.godot
+terraform|weak|*.tf
+ansible|strong|ansible.cfg
+ansible|weak|playbook.yml
+helm|strong|Chart.yaml
+latex|weak|*.tex
+visualstudiocode|strong|.vscode/settings.json
+visualstudiocode|strong|.vscode/launch.json
+jetbrains|strong|.idea/workspace.xml
+jetbrains|weak|*.iml'
+
+# Directories that are never the project. Pruning them is not an optimisation,
+# it is correctness: right after 'git init' nothing is ignored yet, so
+# 'git ls-files -o' lists every file in node_modules/, and gsh would otherwise
+# detect somebody else's dependency tree as if it were this repository.
+SCAN_PRUNE_RE='(^|/)(\.git|node_modules|vendor|target|dist|build|\.venv|venv|__pycache__|Pods|\.next|\.nuxt|bower_components)/'
+
+# Path segments that mean "this file is material, not the project" - used only
+# to discard weak markers (see SCAN_RULES).
+SCAN_FIXTURE_DIRS='test tests spec specs fixture fixtures testdata example examples sample samples demo demos doc docs'
+
+# true when some *directory* component of <path> is a fixture directory. The
+# basename is deliberately excluded: 'infra/test.tf' is a Terraform file called
+# test, 'tests/x.tf' is test data.
+is_fixture_path() {
+    local dir="${1%/*}" seg rest
+    [ "$dir" != "$1" ] || return 1
+    rest="$dir/"
+    while [ -n "$rest" ]; do
+        seg="${rest%%/*}"
+        rest="${rest#*/}"
+        case " $SCAN_FIXTURE_DIRS " in *" $seg "*) return 0 ;; esac
+    done
+    return 1
+}
+
+# Index of <name> in the T_NAME table detect_stack is building, or 0, left in
+# TPL_IDX. bash 3.2 has no associative arrays and the table holds a few dozen
+# entries, so a linear walk over the caller's locals - which dynamic scoping
+# makes visible here - beats anything that would need a fork.
+TPL_IDX=0
+tpl_index() {
+    local k=1
+    TPL_IDX=0
+    while [ "$k" -le "$n_t" ]; do
+        if [ "${T_NAME[k]}" = "$1" ]; then TPL_IDX=$k; return 0; fi
+        k=$((k + 1))
+    done
+}
+
+# prints "template<TAB>reason" for everything detected in this repository,
+# one line per template, reason being the path that triggered it
 detect_stack() {
-    local d
-    d() { printf '%s\t%s\n' "$1" "$2"; }
+    local n_rules=0 n_t=0 i k lits='' t s g l
+    local p depth tpl one rp better
+    local -a R_TPL R_STR R_GLOB T_NAME T_PATH T_DEPTH T_RANK T_COUNT
 
-    [ -f package.json ]     && d node "package.json"
-    [ -f yarn.lock ]        && d node "yarn.lock"
-    [ -f pnpm-lock.yaml ]   && d node "pnpm-lock.yaml"
-    [ -d node_modules ]     && d node "node_modules/"
-    ls next.config.* >/dev/null 2>&1 && d nextjs "next.config.*"
-    ls nuxt.config.* >/dev/null 2>&1 && d nuxtjs "nuxt.config.*"
-    [ -f angular.json ]     && d angular "angular.json"
-    [ -f svelte.config.js ] && d node "svelte.config.js"
+    # Compile the table once: arrays for the match loop below, and a set of
+    # fixed strings for grep to sieve the file list with.
+    #
+    # The sieve is deliberately sloppier than the rules - it keeps the longest
+    # literal run of each glob ('*.tf' -> '.tf'), so it also lets through
+    # 'terraform.tfstate'. That is fine and it is the point: 'grep -F' matches
+    # a few dozen literals in one Aho-Corasick pass, where the equivalent ERE
+    # costs nearly twice as much (0.58s vs 1.07s over 50,000 paths), and the
+    # exact decision is made by the 'case' below anyway - one implementation of
+    # the matching rules, not two that can drift apart. Every glob in
+    # SCAN_RULES therefore has at most one '*', at the start or at the end.
+    while IFS='|' read -r t s g; do
+        [ -n "$g" ] || continue
+        n_rules=$((n_rules + 1))
+        R_TPL[n_rules]=$t; R_STR[n_rules]=$s; R_GLOB[n_rules]=$g
+        case "$g" in
+        \**) l=${g#\*} ;;
+        *\*) l=${g%\*} ;;
+        *)   l=$g ;;
+        esac
+        lits="${lits:+$lits
+}$l"
+    done <<EOF
+$SCAN_RULES
+EOF
 
-    [ -f pyproject.toml ]    && d python "pyproject.toml"
-    [ -f requirements.txt ]  && d python "requirements.txt"
-    [ -f setup.py ]          && d python "setup.py"
-    [ -f Pipfile ]           && d python "Pipfile"
-    [ -d .venv ] || [ -d venv ] && d python "virtualenv"
-    [ -f manage.py ]         && d django "manage.py"
+    # One pass over the whole repository. git's index answers "what is in this
+    # project" far faster than walking directories (0.09s vs 0.23s for 'find'
+    # over 50,000 files), and -o --exclude-standard adds the files that are not
+    # committed yet without ever showing us something the user already chose to
+    # ignore. Three processes in total: the listing, the prune and the sieve -
+    # by the time bash sees a path, only a handful are left, which is why this
+    # is a plain loop and not a fan-out. -z throughout because paths hold
+    # spaces, newlines and non-ASCII, and git would C-quote them otherwise.
+    # LC_ALL=C on the greps because the patterns are ASCII and UTF-8 is
+    # self-synchronising, so byte matching cannot produce a false hit - it just
+    # skips the multibyte machinery, worth about 15%.
+    while IFS= read -r -d '' p; do
+        i=1
+        while [ "$i" -le "$n_rules" ]; do
+            case "/$p" in */${R_GLOB[i]}) break ;; esac
+            i=$((i + 1))
+        done
+        [ "$i" -le "$n_rules" ] || continue
+        [ "${R_STR[i]}" != weak ] || ! is_fixture_path "$p" || continue
 
-    [ -f Cargo.toml ]   && d rust "Cargo.toml"
-    [ -f go.mod ]       && d go "go.mod"
-    [ -f pom.xml ]      && d maven "pom.xml"
-    ls build.gradle* >/dev/null 2>&1 && d gradle "build.gradle"
-    [ -f pom.xml ] || ls build.gradle* >/dev/null 2>&1 && d java "jvm project"
-    [ -f Gemfile ]      && d ruby "Gemfile"
-    [ -f config/application.rb ] && d rails "config/application.rb"
-    [ -f composer.json ] && d composer "composer.json"
-    [ -f artisan ]      && d laravel "artisan"
-    [ -f pubspec.yaml ] && d dart "pubspec.yaml"
-    [ -f CMakeLists.txt ] && d cmake "CMakeLists.txt"
-    [ -f Package.swift ] && d swift "Package.swift"
-    [ -f Podfile ]      && d cocoapods "Podfile"
-    ls *.xcodeproj >/dev/null 2>&1 && d xcode "*.xcodeproj"
-    ls *.sln *.csproj >/dev/null 2>&1 && d visualstudio "*.sln / *.csproj"
-    ls *.tf >/dev/null 2>&1 && d terraform "*.tf"
-    ls *.tex >/dev/null 2>&1 && d latex "*.tex"
-    [ -d Assets ] && [ -d ProjectSettings ] && d unity "Unity project"
+        tpl=${R_TPL[i]}
+        # pubspec.yaml is Dart's manifest and Flutter's; only one of them
+        # depends on the Flutter SDK, and the file says which.
+        case "${R_GLOB[i]}" in
+        pubspec.yaml)
+            if [ -f "$p" ] && grep -qE '^[[:space:]]*(flutter:|sdk:[[:space:]]*flutter)' "$p" 2>/dev/null; then
+                tpl=flutter
+            fi
+            ;;
+        esac
 
-    [ -d .vscode ] && d visualstudiocode ".vscode/"
-    [ -d .idea ]   && d jetbrains ".idea/"
+        depth=${p//[^\/]/}
+        depth=${#depth}
+        for one in $tpl; do
+            tpl_index "$one"
+            if [ "$TPL_IDX" -eq 0 ]; then
+                n_t=$((n_t + 1))
+                T_NAME[n_t]=$one; T_PATH[n_t]=$p
+                T_DEPTH[n_t]=$depth; T_RANK[n_t]=$i; T_COUNT[n_t]=1
+            else
+                T_COUNT[TPL_IDX]=$(( ${T_COUNT[TPL_IDX]} + 1 ))
+                # Shallowest wins: 'frontend/package.json' explains a monorepo
+                # better than 'frontend/packages/ui/vendored/package.json'.
+                # Ties go to the earlier rule (node reports package.json, not
+                # the package-lock.json beside it) and then to the first path
+                # in sort order - git lists untracked files before tracked
+                # ones, so "whichever came first" would make the line the user
+                # sees depend on what happens to be committed.
+                better=0
+                if [ "$depth" -lt "${T_DEPTH[TPL_IDX]}" ]; then
+                    better=1
+                elif [ "$depth" -eq "${T_DEPTH[TPL_IDX]}" ]; then
+                    if [ "$i" -lt "${T_RANK[TPL_IDX]}" ]; then
+                        better=1
+                    elif [ "$i" -eq "${T_RANK[TPL_IDX]}" ] &&
+                        [ "$p" \< "${T_PATH[TPL_IDX]}" ]; then
+                        better=1
+                    fi
+                fi
+                if [ "$better" -eq 1 ]; then
+                    T_PATH[TPL_IDX]=$p; T_DEPTH[TPL_IDX]=$depth; T_RANK[TPL_IDX]=$i
+                fi
+            fi
+        done
+    done < <(git ls-files -z -c -o --exclude-standard 2>/dev/null |
+        LC_ALL=C grep -zEv "$SCAN_PRUNE_RE" |
+        LC_ALL=C grep -zF -e "$lits")
+
+    # An ignored directory is invisible to git ls-files by design, so the few
+    # that are conclusive on their own still get a direct look. They never
+    # override a real path found by the scan.
+    set -- node_modules node 'node_modules/' \
+        .venv python '.venv/' \
+        venv python 'venv/' \
+        .vscode visualstudiocode '.vscode/' \
+        .idea jetbrains '.idea/'
+    while [ $# -ge 3 ]; do
+        if [ -d "$1" ]; then
+            tpl_index "$2"
+            if [ "$TPL_IDX" -eq 0 ]; then
+                n_t=$((n_t + 1))
+                T_NAME[n_t]=$2; T_PATH[n_t]=$3
+                T_DEPTH[n_t]=0; T_RANK[n_t]=$n_rules; T_COUNT[n_t]=1
+            fi
+        fi
+        shift 3
+    done
+
+    # Emit in table order - the table is grouped by ecosystem, so a polyglot
+    # repo reads top-down like a stack list instead of like an alphabet.
+    # Ordering by the rule that won, not by the rule's template list, is what
+    # keeps flutter next to the other pubspec.yaml stacks.
+    i=1
+    while [ "$i" -le "$n_rules" ]; do
+        k=1
+        while [ "$k" -le "$n_t" ]; do
+            [ "${T_RANK[k]}" -eq "$i" ] && emit_detection "$k"
+            k=$((k + 1))
+        done
+        i=$((i + 1))
+    done
+    k=1
+    while [ "$k" -le "$n_t" ]; do
+        emit_detection "$k"
+        k=$((k + 1))
+    done
 
     case "$(uname -s 2>/dev/null)" in
-    Darwin) d macos "you are on macOS" ;;
-    Linux)  d linux "you are on Linux" ;;
-    MINGW* | MSYS* | CYGWIN*) d windows "you are on Windows" ;;
+    Darwin) printf 'macos\tyou are on macOS\n' ;;
+    Linux)  printf 'linux\tyou are on Linux\n' ;;
+    MINGW* | MSYS* | CYGWIN*) printf 'windows\tyou are on Windows\n' ;;
     esac
+}
+
+# emit_detection <index> - one "template<TAB>path" line, then blanks the slot
+# so the second pass cannot print it twice. Reads detect_stack's locals.
+emit_detection() {
+    local j=$1 rp
+    rp=${T_PATH[j]}
+    [ -n "$rp" ] || return 0
+    T_PATH[j]=''
+    # the reason travels to cmd_auto as one tab-separated line, and a path may
+    # legitimately contain a tab or a newline
+    rp=${rp//	/?}
+    rp=${rp//$'\n'/?}
+    rp=${rp//$'\r'/?}
+    # a deep path is still worth showing; the tail is the informative half
+    [ "${#rp}" -le 60 ] || rp="...${rp: -57}"
+    if [ "${T_COUNT[j]}" -gt 1 ]; then
+        rp="$rp +$(( ${T_COUNT[j]} - 1 )) more"
+    fi
+    printf '%s\t%s\n' "${T_NAME[j]}" "$rp"
 }
 
 cmd_auto() {
     require_git_repo || return 1
     ensure_catalog
 
-    local found
-    found=$(detect_stack | sort -u)
+    # read the catalog once: the loop below checks every detected name against
+    # it, and 'catalog' is a pipeline of five processes plus one 'basename' per
+    # local template - fifteen detections in a monorepo made that ~200 forks
+    local found catalog_all
+    catalog_all=$(catalog)
+    # detect_stack already emits one line per template, in table order
+    found=$(detect_stack)
 
     if [ -z "$found" ]; then
         warn "no known stack detected in $(pwd)"
@@ -755,10 +996,13 @@ cmd_auto() {
         [ -n "$name" ] || continue
         # a name detect_stack emits but the catalog does not have is our bug,
         # not the user's: say so instead of dropping the detection silently
-        known_template "$name" || {
+        case $'\n'"$catalog_all"$'\n' in
+        *$'\n'"$name"$'\n'*) ;;
+        *)
             warn "skipping '$name' ($reason): no such template available"
             continue
-        }
+            ;;
+        esac
         # one line per template, even when several files point at it
         case " $seen " in
         *" $name "*) continue ;;
